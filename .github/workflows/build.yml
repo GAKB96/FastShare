@@ -1,13 +1,56 @@
 name: Build FastShare.exe
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install pyinstaller
-      - run: pyinstaller --noconfirm --onefile --windowed --name FastShare FastShare.py
+      - run: pip install pyinstaller tkinterdnd2
+      - name: Engine tests (all failure scenarios)
+        run: python -m unittest discover -s tests -v
+      - name: Build exe
+        run: pyinstaller --noconfirm --onefile --windowed --name FastShare --collect-all tkinterdnd2 FastShare.py
+      - name: Self-test the built exe (real window, sends files to itself)
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $env:FASTSHARE_SELFTEST = "$PWD\selftest_exe.json"
+          Start-Process dist\FastShare.exe -Wait
+          python tests/report.py selftest_exe.json exe
       - uses: actions/upload-artifact@v4
         with: { name: FastShare-exe, path: dist/FastShare.exe }
+      - name: Screenshots, light and dark
+        if: always()
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          pip install pillow
+          $env:FASTSHARE_SHOTS = "$PWD\shots\light"; $env:FASTSHARE_THEME = "light"; $env:FASTSHARE_SELFTEST = "$PWD\shots\light.json"
+          New-Item -ItemType Directory -Force shots | Out-Null
+          python FastShare.py
+          $env:FASTSHARE_SHOTS = "$PWD\shots\dark"; $env:FASTSHARE_THEME = "dark"; $env:FASTSHARE_SELFTEST = "$PWD\shots\dark.json"
+          python FastShare.py
+          python tests/report.py shots\light.json light; $a = $LASTEXITCODE
+          python tests/report.py shots\dark.json dark; if ($a -ne 0 -or $LASTEXITCODE -ne 0) { exit 1 }
+      - name: Publish screenshots to the ci-screens branch
+        if: always()
+        shell: bash
+        run: |
+          [ -d shots ] || exit 0
+          cp -r shots selftest_exe.json /tmp/ 2>/dev/null || cp -r shots /tmp/
+          git config user.name "fastshare-ci"; git config user.email "ci@users.noreply.github.com"
+          git checkout --orphan ci-screens
+          git rm -rf --cached . -q
+          rm -rf ./*
+          cp -r /tmp/shots . ; cp /tmp/selftest_exe.json . 2>/dev/null || true
+          git add -f shots selftest_exe.json 2>/dev/null || git add -f shots
+          git commit -qm "Screenshots from ${GITHUB_SHA::7}"
+          git push -f origin ci-screens

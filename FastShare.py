@@ -1,810 +1,1043 @@
 """
-FastShare - send files of any size between PCs (and phones) on the same Wi-Fi,
-at the full speed of your network. No internet, no cloud, no size limit.
+FastShare - Quick Share-style file sharing between Windows PCs on the same Wi-Fi.
 
-PC <-> PC : both PCs run FastShare. They find each other automatically.
-Phone     : turn on "Phone / browser sharing" and open the address shown
-            in the phone's browser to upload or download.
-
-Pure Python standard library - no extra packages needed.
+Drop files (or folders) on the window, then click a device to send them.
+Any size, straight over your local network, no internet needed.
 """
-import os, sys, json, socket, struct, threading, time, queue, uuid, html, urllib.parse
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+import os, sys, time, json, queue, threading, traceback, subprocess
+import tkinter as tk
+from tkinter import filedialog
 
-APP = "FastShare"
-VERSION = "1.0"
-TCP_PORT = 52525          # PC-to-PC transfers
-UDP_PORT = 52526          # auto-discovery
-WEB_PORT = 8080           # phone / browser page
-MAGIC = b"FSHR1"
-CHUNK = 4 * 1024 * 1024   # 4 MB blocks
-SOCKBUF = 8 * 1024 * 1024 # large socket buffers for full speed
-INSTANCE = uuid.uuid4().hex[:12]
-HOSTNAME = socket.gethostname()
+import fastshare_core as C
+
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    HAVE_DND = True
+except Exception:
+    HAVE_DND = False
+
+FONT = "Segoe UI"
+ICONS = "Segoe MDL2 Assets"
+IC = dict(bolt="", upload="", download="", folder="", file="",
+          laptop="", pc="", close="", check="", wifi="", add="",
+          search="", warn="", info="", error="", open="")
+
+LIGHT = dict(bg="#f3f3f3", card="#ffffff", border="#e2e2e2", text="#1b1b1b", sub="#5c5c5c", muted="#8a8a8a",
+             accent="#2563eb", accent_bg="#e7eefc", accent_text="#1d4ed8", on_accent="#ffffff",
+             ok="#107c10", ok_bg="#e5f3e5", warn="#9a5b00", warn_bg="#fcf0da", bad="#c42b1c", bad_bg="#fde7e9",
+             drop="#f7f9ff", drop_hot="#e2eafc", track="#e6e6e6", hover="#f5f7fb", toast="#2b2b2b", toast_text="#ffffff")
+DARK = dict(bg="#1c1c1c", card="#2a2a2a", border="#3a3a3a", text="#f2f2f2", sub="#b4b4b4", muted="#8c8c8c",
+            accent="#3b82f6", accent_bg="#22314b", accent_text="#9cc0ff", on_accent="#ffffff",
+            ok="#6ccb5f", ok_bg="#1e3320", warn="#f0c35a", warn_bg="#3a2f16", bad="#ff99a4", bad_bg="#45242a",
+            drop="#232831", drop_hot="#2b3a55", track="#3a3a3a", hover="#303540", toast="#f2f2f2", toast_text="#1b1b1b")
 
 
-# ----------------------------------------------------------------- helpers
-def config_path():
+# ------------------------------------------------------------------ small Windows helpers
+def windows_dark():
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+    except Exception:
+        return False
+
+
+def app_dir():
     base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, APP, "config.json")
+    d = os.path.join(base, C.APP)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def log(msg):
+    try:
+        p = os.path.join(app_dir(), "fastshare.log")
+        if os.path.exists(p) and os.path.getsize(p) > 1_000_000:
+            os.replace(p, p + ".old")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + msg + "\n")
+    except Exception:
+        pass
+
 
 def load_config():
     try:
-        with open(config_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(os.path.join(app_dir(), "config.json"), encoding="utf-8") as f:
+            c = json.load(f)
+            return c if isinstance(c, dict) else {}
     except Exception:
         return {}
 
+
 def save_config(cfg):
     try:
-        os.makedirs(os.path.dirname(config_path()), exist_ok=True)
-        with open(config_path(), "w", encoding="utf-8") as f:
+        p = os.path.join(app_dir(), "config.json")
+        with open(p + ".tmp", "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
+        os.replace(p + ".tmp", p)
+    except Exception as e:
+        log(f"config save failed: {e}")
 
-def default_save_dir():
-    return os.path.join(os.path.expanduser("~"), "Downloads", APP)
 
-def local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def open_folder(path):
     try:
-        s.connect(("10.255.255.255", 1))   # no packet is actually sent
-        return s.getsockname()[0]
-    except OSError:
+        os.makedirs(C.L(path), exist_ok=True)
+        if C.IS_WIN:
+            os.startfile(path)
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        log(f"open folder failed: {e}")
+
+
+def keep_awake(on):
+    if C.IS_WIN:
         try:
-            return socket.gethostbyname(HOSTNAME)
-        except OSError:
-            return "127.0.0.1"
-    finally:
-        s.close()
-
-def human(n):
-    n = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-
-def safe_rel(p):
-    """Turn an incoming path into a safe relative Windows path (no .., no drive letters)."""
-    p = str(p).replace("\\", "/")
-    bad = '<>:"|?*'
-    parts = []
-    for x in p.split("/"):
-        if x in ("", ".", ".."):
-            continue
-        x = "".join("_" if (c in bad or ord(c) < 32) else c for c in x).rstrip(". ")
-        parts.append(x or "_")
-    return os.path.join(*parts) if parts else "file"
-
-def unique_path(path):
-    if not os.path.exists(path) and not os.path.exists(path + ".part"):
-        return path
-    base, ext = os.path.splitext(path)
-    i = 1
-    while os.path.exists(f"{base} ({i}){ext}") or os.path.exists(f"{base} ({i}){ext}.part"):
-        i += 1
-    return f"{base} ({i}){ext}"
-
-def tune(sock):
-    for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, opt, SOCKBUF)
-        except OSError:
+            import ctypes
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000001 if on else 0x80000000)
+        except Exception:
             pass
 
-def recv_exact(sock, n):
-    buf = bytearray(n)
-    mv = memoryview(buf)
-    got = 0
-    while got < n:
-        r = sock.recv_into(mv[got:])
-        if not r:
-            raise ConnectionError("Connection closed by the other device")
-        got += r
-    return bytes(buf)
 
-def collect_folder(folder):
-    """Return [(abs_path, relative_name)] for every file inside a folder (keeps the folder name)."""
-    out = []
-    root_name = os.path.basename(os.path.normpath(folder))
-    for dirpath, _, files in os.walk(folder):
-        for fn in files:
-            ap = os.path.join(dirpath, fn)
-            rel = os.path.join(root_name, os.path.relpath(ap, folder))
-            out.append((ap, rel))
-    return out
+def short(s, n):
+    return s if len(s) <= n else s[:n - 1] + "…"
 
 
-# ------------------------------------------------------- PC -> PC sending
-def send_files(host, items, cb=None, port=TCP_PORT):
-    """items = [(abs_path, relative_name)]. cb(done_bytes, total_bytes, current_name)."""
-    files = [{"path": rel.replace("\\", "/"), "size": os.path.getsize(p)} for p, rel in items]
-    total = sum(f["size"] for f in files)
-    manifest = json.dumps({"sender": HOSTNAME, "files": files, "total": total}).encode("utf-8")
-
-    with socket.create_connection((host, port), timeout=10) as s:
-        tune(s)
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        s.sendall(MAGIC + struct.pack("!I", len(manifest)) + manifest)
-        s.settimeout(150)                       # wait for the other person to click Accept
-        if recv_exact(s, 1) != b"Y":
-            raise PermissionError("The other device declined the transfer.")
-        s.settimeout(60)
-        buf = bytearray(CHUNK)
-        mv = memoryview(buf)
-        done = 0
-        for (p, rel), f in zip(items, files):
-            left = f["size"]
-            with open(p, "rb", buffering=0) as fh:
-                while left > 0:
-                    n = fh.readinto(mv[:min(CHUNK, left)])
-                    if not n:
-                        raise IOError(f"{rel} got smaller while sending")
-                    s.sendall(mv[:n])
-                    left -= n
-                    done += n
-                    if cb:
-                        cb(done, total, rel)
-        s.settimeout(120)
-        if recv_exact(s, 1) != b"K":
-            raise ConnectionError("Receiver did not confirm.")
-    return total
+def valid_host(s):
+    if not s or len(s) > 253 or " " in s:
+        return False
+    parts = s.split(".")
+    if all(p.isdigit() for p in parts):
+        return len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts)
+    return all(p and all(c.isalnum() or c == "-" for c in p) for p in parts)
 
 
-# ------------------------------------------------------ PC -> PC receiving
-class Receiver(threading.Thread):
-    """Listens for incoming transfers from other FastShare PCs."""
+# ================================================================== widgets
+class Btn(tk.Label):
+    def __init__(self, parent, app, text, command, kind="secondary", icon=None, size=10):
+        P = app.P
+        self.kind, self.P, self.command = kind, P, command
+        super().__init__(parent, text=text, cursor="hand2", font=(FONT, size, "bold" if kind == "primary" else "normal"),
+                         padx=app.S(14), pady=app.S(6), highlightthickness=1 if kind == "secondary" else 0)
+        self.paint(False)
+        self.bind("<Enter>", lambda e: self.paint(True))
+        self.bind("<Leave>", lambda e: self.paint(False))
+        self.bind("<ButtonRelease-1>", lambda e: self.command() if self.command else None)
 
-    def __init__(self, get_save_dir, ask, cb=None, log=print, port=TCP_PORT):
-        super().__init__(daemon=True)
-        self.get_save_dir, self.ask, self.cb, self.log, self.port = get_save_dir, ask, cb, log, port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tune(self.sock)
-        self.sock.bind(("0.0.0.0", port))
-        self.sock.listen(8)
+    def paint(self, hot):
+        P = self.P
+        if self.kind == "primary":
+            self.configure(bg=P["accent_text"] if hot else P["accent"], fg=P["on_accent"])
+        elif self.kind == "link":
+            self.configure(bg=self.master["bg"], fg=P["accent_text"], padx=2, pady=0,
+                           font=(FONT, 9, "underline" if hot else "normal"))
+        else:
+            self.configure(bg=P["hover"] if hot else P["card"], fg=P["text"],
+                           highlightbackground=P["border"], highlightcolor=P["border"])
 
-    def run(self):
-        while True:
-            try:
-                conn, addr = self.sock.accept()
-            except OSError:
-                return
-            threading.Thread(target=self.handle, args=(conn, addr), daemon=True).start()
 
-    def handle(self, conn, addr):
-        tmp = None
-        try:
-            with conn:
-                tune(conn)
-                conn.settimeout(30)
-                if recv_exact(conn, len(MAGIC)) != MAGIC:
-                    return
-                ln = struct.unpack("!I", recv_exact(conn, 4))[0]
-                if ln > 64 * 1024 * 1024:
-                    return
-                man = json.loads(recv_exact(conn, ln).decode("utf-8"))
-                ok = self.ask(man, addr[0])
-                conn.sendall(b"Y" if ok else b"N")
-                if not ok:
-                    self.log(f"Declined {len(man['files'])} file(s) from {man.get('sender', addr[0])}")
-                    return
-                save = self.get_save_dir()
-                os.makedirs(save, exist_ok=True)
-                total = int(man["total"])
-                done = 0
-                buf = bytearray(CHUNK)
-                mv = memoryview(buf)
-                conn.settimeout(60)
-                for f in man["files"]:
-                    rel = safe_rel(f["path"])
-                    size = int(f["size"])
-                    dest = unique_path(os.path.join(save, rel))
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    tmp = dest + ".part"
-                    with open(tmp, "wb", buffering=0) as out:
-                        left = size
-                        while left > 0:
-                            n = conn.recv_into(mv[:min(CHUNK, left)])
-                            if not n:
-                                raise ConnectionError("Sender disconnected")
-                            out.write(mv[:n])
-                            left -= n
-                            done += n
-                            if self.cb:
-                                self.cb(done, total, rel)
-                    os.replace(tmp, dest)
-                    tmp = None
-                conn.sendall(b"K")
-                self.log(f"Received {len(man['files'])} file(s), {human(total)} from {man.get('sender', addr[0])}")
-        except Exception as e:
-            self.log(f"Receive failed from {addr[0]}: {e}")
-            if self.cb:
-                self.cb(-1, 0, str(e))
-        finally:
-            if tmp and os.path.exists(tmp):
+class Circle(tk.Canvas):
+    def __init__(self, parent, app, size, glyph, gsize=13):
+        self.app, self.size = app, app.S(size)
+        super().__init__(parent, width=self.size, height=self.size, highlightthickness=0, bg=parent["bg"])
+        self.oval = self.create_oval(1, 1, self.size - 1, self.size - 1, outline="")
+        self.text = self.create_text(self.size / 2, self.size / 2, text=glyph, font=(ICONS, gsize))
+
+    def set(self, fill, fg, glyph=None, bg=None):
+        self.itemconfigure(self.oval, fill=fill)
+        self.itemconfigure(self.text, fill=fg)
+        if glyph:
+            self.itemconfigure(self.text, text=glyph)
+        if bg:
+            self.configure(bg=bg)
+
+
+class DeviceCard(tk.Frame):
+    def __init__(self, app, parent, ip):
+        P = app.P
+        super().__init__(parent, bg=P["card"], highlightthickness=1, highlightbackground=P["border"], cursor="hand2")
+        self.app, self.ip, self.hot = app, ip, False
+        self.columnconfigure(1, weight=1)
+        self.icon = Circle(self, app, 40, IC["laptop"], 14)
+        self.icon.grid(row=0, column=0, rowspan=2, padx=(app.S(12), app.S(10)), pady=app.S(10))
+        self.name = tk.Label(self, bg=P["card"], fg=P["text"], font=(FONT, 10, "bold"), anchor="w")
+        self.name.grid(row=0, column=1, sticky="sw", pady=(app.S(10), 0))
+        self.status = tk.Label(self, bg=P["card"], fg=P["sub"], font=(FONT, 9), anchor="w")
+        self.status.grid(row=1, column=1, sticky="nw", pady=(0, app.S(10)))
+        self.x = tk.Label(self, text=IC["close"], font=(ICONS, 9), bg=P["card"], fg=P["sub"], cursor="hand2", padx=app.S(10))
+        self.x.bind("<ButtonRelease-1>", lambda e: app.cancel_for(ip))
+        self.bar = tk.Canvas(self, height=app.S(5), bg=P["track"], highlightthickness=0)
+        self.fill = self.bar.create_rectangle(0, 0, 0, app.S(5), fill=P["accent"], outline="")
+        self.showing_bar = self.showing_x = False
+        for w in (self, self.icon, self.name, self.status):
+            w.bind("<ButtonRelease-1>", lambda e: app.on_card_click(ip))
+            w.bind("<Enter>", lambda e: self.hover(True))
+            w.bind("<Leave>", self.leave)
+            w.bind("<Button-3>", lambda e: app.card_menu(ip, e))
+            if HAVE_DND:
                 try:
-                    os.remove(tmp)
-                except OSError:
+                    w.drop_target_register(DND_FILES)
+                    w.dnd_bind("<<Drop>>", lambda e: app.on_drop(e, ip))
+                    w.dnd_bind("<<DropEnter>>", lambda e: (self.hover(True), e.action)[1])
+                    w.dnd_bind("<<DropLeave>>", lambda e: (self.hover(False), e.action)[1])
+                except Exception:
                     pass
 
+    def leave(self, e):
+        w = self.winfo_containing(e.x_root, e.y_root)
+        while w is not None and w is not self:
+            w = getattr(w, "master", None)
+        if w is None:
+            self.hover(False)
 
-# ------------------------------------------------------------- discovery
-class Discovery(threading.Thread):
-    """Announces this PC on the network and keeps a list of other FastShare PCs."""
+    def hover(self, on):
+        if on != self.hot:
+            self.hot = on
+            self.configure(highlightbackground=self.app.P["accent"] if on else self.app.P["border"])
 
-    def __init__(self, port=UDP_PORT):
-        super().__init__(daemon=True)
-        self.port = port
-        self.peers = {}   # ip -> (name, last_seen)
-        self.lock = threading.Lock()
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.bind(("", port))
-
-    def announce(self):
-        msg = f"FSHR|{INSTANCE}|{HOSTNAME}|{TCP_PORT}".encode("utf-8")
-        targets = {"255.255.255.255"}
-        ip = local_ip()
-        if ip.count(".") == 3:
-            targets.add(".".join(ip.split(".")[:3]) + ".255")
-        for t in targets:
-            try:
-                self.sock.sendto(msg, (t, self.port))
-            except OSError:
-                pass
-
-    def _announcer(self):
-        while True:
-            self.announce()
-            time.sleep(2)
-
-    def run(self):
-        threading.Thread(target=self._announcer, daemon=True).start()
-        while True:
-            try:
-                data, addr = self.sock.recvfrom(1024)
-            except OSError:
-                continue
-            try:
-                tag, inst, name, _ = data.decode("utf-8").split("|", 3)
-            except ValueError:
-                continue
-            if tag != "FSHR" or inst == INSTANCE:
-                continue
-            first = addr[0] not in self.peers
-            with self.lock:
-                self.peers[addr[0]] = (name, time.time())
-            if first:          # answer straight away so new PCs show up instantly
-                self.announce()
-
-    def list(self):
-        now = time.time()
-        with self.lock:
-            return sorted(((ip, n) for ip, (n, t) in self.peers.items() if now - t < 7), key=lambda x: x[1].lower())
+    def update_view(self, name, status, fg, circle_bg, glyph, pct=None, cancellable=False):
+        P = self.app.P
+        if self.name["text"] != name:
+            self.name.configure(text=short(name, 34))
+        if self.status["text"] != status or self.status["fg"] != fg:
+            self.status.configure(text=status, fg=fg)
+        self.icon.set(circle_bg, fg, glyph)
+        if cancellable != self.showing_x:
+            self.showing_x = cancellable
+            (self.x.grid(row=0, column=2, rowspan=2, sticky="ns") if cancellable else self.x.grid_remove())
+        show_bar = pct is not None
+        if show_bar != self.showing_bar:
+            self.showing_bar = show_bar
+            if show_bar:
+                self.bar.grid(row=2, column=0, columnspan=3, sticky="ew", padx=self.app.S(12), pady=(0, self.app.S(10)))
+            else:
+                self.bar.grid_remove()
+        if show_bar:
+            w = self.bar.winfo_width()
+            self.bar.coords(self.fill, 0, 0, max(0, w * pct), self.app.S(5))
+            self.bar.itemconfigure(self.fill, fill=fg)
 
 
-# ------------------------------------------------- phone / browser sharing
-WEB_PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FastShare - __HOST__</title>
-<style>
-body{font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#0f1115;color:#e8e8ea;margin:0;padding:18px;max-width:640px;margin:auto}
-h1{font-size:22px;margin:4px 0 2px}.sub{color:#8a8f98;font-size:13px;margin-bottom:18px}
-.card{background:#181b22;border:1px solid #262a33;border-radius:14px;padding:16px;margin-bottom:16px}
-h2{font-size:15px;margin:0 0 12px;color:#9fb4ff}
-label.btn,button{display:inline-block;background:#3d63ff;color:#fff;border:0;border-radius:10px;padding:12px 18px;font-size:15px;cursor:pointer}
-input[type=file]{display:none}
-.bar{height:10px;background:#262a33;border-radius:6px;overflow:hidden;margin:12px 0 6px}
-.bar div{height:100%;width:0;background:linear-gradient(90deg,#3d63ff,#7c4dff);transition:width .15s}
-#st{font-size:13px;color:#b9bec8;min-height:18px}
-a.f{display:flex;justify-content:space-between;gap:10px;padding:12px 4px;border-bottom:1px solid #262a33;color:#e8e8ea;text-decoration:none}
-a.f span:last-child{color:#8a8f98;white-space:nowrap}.empty{color:#8a8f98;font-size:14px}
-</style></head><body>
-<h1>FastShare</h1><div class="sub">Connected to <b>__HOST__</b></div>
-<div class="card"><h2>Send to this PC</h2>
-<label class="btn">Choose files<input id="f" type="file" multiple onchange="up()"></label>
-<div class="bar"><div id="b"></div></div><div id="st"></div></div>
-<div class="card"><h2>Download from this PC</h2><div id="list" class="empty">Loading...</div>
-<div style="margin-top:12px"><button onclick="load()">Refresh</button></div></div>
-<script>
-const K=location.pathname.split('/')[1], st=document.getElementById('st'), bar=document.getElementById('b');
-function hs(n){const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}return (i?n.toFixed(1):n)+' '+u[i]}
-function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-async function load(){try{const r=await fetch('/'+K+'/list');const j=await r.json();const L=document.getElementById('list');
- if(!j.length){L.className='empty';L.textContent='Nothing shared yet. Add files in FastShare on the PC.';return}
- L.className='';L.innerHTML=j.map((f,i)=>'<a class="f" href="/'+K+'/dl/'+i+'"><span>'+esc(f.name)+'</span><span>'+hs(f.size)+'</span></a>').join('')}catch(e){}}
-function up(){const fs=[...document.getElementById('f').files];if(!fs.length)return;
- const total=fs.reduce((a,f)=>a+f.size,0);let base=0,i=0;const t0=Date.now();
- (function next(){if(i>=fs.length){bar.style.width='100%';st.textContent='Done - '+fs.length+' file(s) sent ✓';document.getElementById('f').value='';return}
-  const f=fs[i],x=new XMLHttpRequest();x.open('PUT','/'+K+'/upload?name='+encodeURIComponent(f.name));
-  x.upload.onprogress=e=>{const d=base+e.loaded,s=d/Math.max(.001,(Date.now()-t0)/1000);bar.style.width=(100*d/total).toFixed(1)+'%';
-   st.textContent='Sending '+(i+1)+'/'+fs.length+' • '+hs(d)+' of '+hs(total)+' • '+hs(s)+'/s'};
-  x.onload=()=>{if(x.status!==200){st.textContent='Failed: '+x.responseText;return}base+=f.size;i++;next()};
-  x.onerror=()=>{st.textContent='Connection lost. Is FastShare still open on the PC?'};x.send(f)})()}
-load();
-</script></body></html>"""
+class Dialog(tk.Toplevel):
+    """Rounded-feel modal card used for incoming files, duplicates and questions."""
 
-
-class WebShare:
-    """Small web server so phones/any browser can upload to and download from this PC."""
-
-    def __init__(self, key, get_shared, get_save_dir, cb=None, log=print, port=WEB_PORT):
-        app = self
-        self.key, self.get_shared, self.get_save_dir, self.cb, self.log = key, get_shared, get_save_dir, cb, log
-
-        class H(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def log_message(self, *a):
-                pass
-
-            def _route(self):
-                u = urllib.parse.urlsplit(self.path)
-                parts = u.path.strip("/").split("/")
-                if not parts or parts[0] != app.key:
-                    return None, None
-                return parts[1:], urllib.parse.parse_qs(u.query)
-
-            def _send(self, code, body, ctype="text/plain; charset=utf-8"):
-                if isinstance(body, str):
-                    body = body.encode("utf-8")
-                self.send_response(code)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self):
-                rest, _ = self._route()
-                if rest is None:
-                    return self._send(404, "Not found. Use the full address shown in FastShare.")
-                shared = app.get_shared()
-                if rest in ([], [""]):
-                    return self._send(200, WEB_PAGE.replace("__HOST__", html.escape(HOSTNAME)), "text/html; charset=utf-8")
-                if rest == ["list"]:
-                    data = []
-                    for p, rel in shared:
-                        try:
-                            data.append({"name": rel.replace("\\", "/"), "size": os.path.getsize(p)})
-                        except OSError:
-                            data.append({"name": rel, "size": 0})
-                    return self._send(200, json.dumps(data), "application/json")
-                if len(rest) == 2 and rest[0] == "dl" and rest[1].isdigit() and int(rest[1]) < len(shared):
-                    p, rel = shared[int(rest[1])]
-                    try:
-                        size = os.path.getsize(p)
-                        fh = open(p, "rb")
-                    except OSError:
-                        return self._send(404, "File no longer available")
-                    name = os.path.basename(rel)
-                    with fh:
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/octet-stream")
-                        self.send_header("Content-Length", str(size))
-                        self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + urllib.parse.quote(name))
-                        self.end_headers()
-                        tune(self.connection)
-                        self.connection.sendfile(fh)
-                    app.log(f"Phone/browser {self.client_address[0]} downloaded {name}")
-                    return
-                return self._send(404, "Not found")
-
-            def do_PUT(self):
-                rest, q = self._route()
-                if rest != ["upload"]:
-                    return self._send(404, "Not found")
-                name = os.path.basename(safe_rel((q.get("name") or ["upload.bin"])[0]))
-                try:
-                    length = int(self.headers.get("Content-Length", "-1"))
-                except ValueError:
-                    length = -1
-                if length < 0:
-                    return self._send(411, "Content-Length required")
-                save = app.get_save_dir()
-                os.makedirs(save, exist_ok=True)
-                dest = unique_path(os.path.join(save, name))
-                tmp = dest + ".part"
-                left, done = length, 0
-                try:
-                    with open(tmp, "wb", buffering=0) as out:
-                        while left > 0:
-                            chunk = self.rfile.read(min(CHUNK, left))
-                            if not chunk:
-                                raise ConnectionError("upload interrupted")
-                            out.write(chunk)
-                            left -= len(chunk)
-                            done += len(chunk)
-                            if app.cb:
-                                app.cb(done, length, name)
-                    os.replace(tmp, dest)
-                except Exception as e:
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-                    app.log(f"Phone/browser upload failed: {e}")
-                    self.close_connection = True
-                    return
-                app.log(f"Received {name} ({human(length)}) from phone/browser {self.client_address[0]}")
-                return self._send(200, "ok")
-
-        self.server = ThreadingHTTPServer(("0.0.0.0", port), H)
-        self.server.daemon_threads = True
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-
-    def stop(self):
-        self.server.shutdown()
-        self.server.server_close()
-
-
-# ===================================================================== GUI
-def run_gui():
-    import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
-    import secrets
-
-    try:  # sharp text on high-DPI laptop screens
-        import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-
-    cfg = load_config()
-
-    class App:
-        def __init__(self, root):
-            self.root = root
-            self.q = queue.Queue()
-            self.items = []                 # [(abs_path, rel_name)]
-            self.shared = ()                # snapshot read by web server threads
-            self.save_dir = cfg.get("save_dir") or default_save_dir()
-            self.ask_first = cfg.get("ask_first", True)
-            self.web = None
-            self.web_key = cfg.get("web_key") or secrets.token_hex(3)
-            self.prog = {"done": 0, "total": 0, "name": "", "mode": "", "start": 0, "err": None, "end": 0}
-            self.plock = threading.Lock()
-            self.sending = False
-
-            root.title(f"{APP} - fast Wi-Fi file sharing")
-            root.geometry("900x640")
-            root.minsize(760, 560)
-            self.build()
-
-            try:
-                self.disc = Discovery()
-                self.disc.start()
-            except OSError as e:
-                self.disc = None
-                self.log(f"Auto-discovery unavailable ({e}). You can still type the other PC's IP.")
-            try:
-                self.recv = Receiver(lambda: self.save_dir, self.ask, self.recv_cb, self.log_threadsafe)
-                self.recv.start()
-            except OSError as e:
-                self.log(f"Could not start receiver on port {TCP_PORT}: {e}. Is FastShare already open?")
-            self.log(f"Ready. This PC is '{HOSTNAME}' at {local_ip()}. Open FastShare on the other PC too.")
-            if cfg.get("web_on"):
-                self.web_var.set(True)
-                self.toggle_web()
-            self.pump()
+    def __init__(self, app, heading, sub="", glyph=IC["info"], tone="accent", names=(), note=None,
+                 buttons=(("OK", None, "primary"),), on_result=None, close_value=None, timeout=None,
+                 timeout_text=None, entry=None):
+        P = app.P
+        super().__init__(app.root)
+        self.app, self.on_result, self.close_value, self.done = app, on_result, close_value, False
+        self.kind = heading
+        self.withdraw()
+        self.title(C.APP)
+        self.configure(bg=P["card"])
+        self.resizable(False, False)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", lambda: self.choose(self.close_value))
+        self.bind("<Escape>", lambda e: self.choose(self.close_value))
+        S = app.S
+        body = tk.Frame(self, bg=P["card"], padx=S(22), pady=S(18))
+        body.pack(fill="both", expand=True)
+        top = tk.Frame(body, bg=P["card"])
+        top.pack(fill="x")
+        c = Circle(top, app, 44, glyph, 16)
+        c.set(P[tone + "_bg"], P[tone if tone != "accent" else "accent_text"])
+        c.pack(side="left", padx=(0, S(12)))
+        tf = tk.Frame(top, bg=P["card"])
+        tf.pack(side="left", fill="x", expand=True)
+        tk.Label(tf, text=heading, bg=P["card"], fg=P["text"], font=(FONT, 12, "bold"), anchor="w",
+                 justify="left", wraplength=S(360)).pack(anchor="w")
+        if sub:
+            tk.Label(tf, text=sub, bg=P["card"], fg=P["sub"], font=(FONT, 9), anchor="w", justify="left",
+                     wraplength=S(360)).pack(anchor="w")
+        if names:
+            lst = tk.Frame(body, bg=P["bg"], padx=S(12), pady=S(8))
+            lst.pack(fill="x", pady=(S(14), 0))
+            for text, tag in names:
+                row = tk.Frame(lst, bg=P["bg"])
+                row.pack(fill="x", pady=1)
+                tk.Label(row, text=short(text, 48), bg=P["bg"], fg=P["text"], font=(FONT, 9), anchor="w").pack(side="left")
+                if tag:
+                    tk.Label(row, text=tag, bg=P["warn_bg"], fg=P["warn"], font=(FONT, 8), padx=6).pack(side="right")
+        if note:
+            nf = tk.Frame(body, bg=P["warn_bg"], padx=S(12), pady=S(8))
+            nf.pack(fill="x", pady=(S(10), 0))
+            tk.Label(nf, text=IC["warn"], font=(ICONS, 10), bg=P["warn_bg"], fg=P["warn"]).pack(side="left", padx=(0, 8))
+            tk.Label(nf, text=note, bg=P["warn_bg"], fg=P["warn"], font=(FONT, 9), justify="left",
+                     wraplength=S(330)).pack(side="left")
+        self.entry_var = None
+        if entry is not None:
+            self.entry_var = tk.StringVar(value=entry)
+            e = tk.Entry(body, textvariable=self.entry_var, font=(FONT, 11), bg=P["bg"], fg=P["text"],
+                         insertbackground=P["text"], relief="flat", highlightthickness=1,
+                         highlightbackground=P["border"], highlightcolor=P["accent"])
+            e.pack(fill="x", pady=(S(14), 0), ipady=S(5))
+            e.focus_set()
+            e.bind("<Return>", lambda ev: self.choose(buttons[-1][1]))
+            self.err = tk.Label(body, text="", bg=P["card"], fg=P["bad"], font=(FONT, 9), anchor="w")
+            self.err.pack(fill="x")
+            self.entry_var.trace_add("write", lambda *a: self.err.configure(text=""))
+        bf = tk.Frame(body, bg=P["card"])
+        bf.pack(fill="x", pady=(S(16), 0))
+        self.timer = tk.Label(bf, text="", bg=P["card"], fg=P["muted"], font=(FONT, 8))
+        self.timer.pack(side="left")
+        self.buttons = {}
+        for label, value, kind in reversed(buttons):
+            b = Btn(bf, app, label, lambda v=value: self.choose(v), kind)
+            b.pack(side="right", padx=(S(8), 0))
+            self.buttons[label] = value
+        self.deadline = time.time() + timeout if timeout else None
+        self.timeout_text = timeout_text
+        app.dialogs.append(self)
+        self.update_idletasks()
+        rx, ry, rw, rh = app.root.winfo_rootx(), app.root.winfo_rooty(), app.root.winfo_width(), app.root.winfo_height()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"+{max(0, rx + (rw - w) // 2)}+{max(0, ry + (rh - h) // 3)}")
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        app.dark_titlebar(self)
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+        if self.deadline:
             self.tick()
 
-        # ---------- layout
-        def build(self):
-            st = ttk.Style()
-            try:
-                st.theme_use("vista")
-            except tk.TclError:
-                pass
-            st.configure("Big.TButton", font=("Segoe UI", 12, "bold"), padding=10)
-            st.configure("H.TLabel", font=("Segoe UI", 15, "bold"))
+    def tick(self):
+        if self.done:
+            return
+        left = int(self.deadline - time.time())
+        if left <= 0:
+            return self.choose(self.close_value)
+        self.timer.configure(text=self.timeout_text.format(left))
+        self.after(500, self.tick)
 
-            top = ttk.Frame(self.root, padding=(12, 10, 12, 0))
-            top.pack(fill="x")
-            ttk.Label(top, text="FastShare", style="H.TLabel").pack(side="left")
-            self.me_lbl = ttk.Label(top, text="")
-            self.me_lbl.pack(side="right")
-
-            mid = ttk.Frame(self.root, padding=12)
-            mid.pack(fill="both", expand=True)
-            mid.columnconfigure(0, weight=1)
-            mid.columnconfigure(1, weight=3)
-            mid.rowconfigure(0, weight=1)
-
-            # devices
-            dev = ttk.LabelFrame(mid, text=" 1. Choose a device ", padding=8)
-            dev.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-            self.peer_list = tk.Listbox(dev, activestyle="none", font=("Segoe UI", 10), exportselection=False)
-            self.peer_list.pack(fill="both", expand=True)
-            self.peer_ips = []
-            ttk.Label(dev, text="...or type its IP address:").pack(anchor="w", pady=(8, 2))
-            self.ip_var = tk.StringVar(value=cfg.get("last_ip", ""))
-            ttk.Entry(dev, textvariable=self.ip_var).pack(fill="x")
-            self.peer_list.bind("<<ListboxSelect>>", lambda e: self.ip_var.set(""))
-
-            # files
-            fr = ttk.LabelFrame(mid, text=" 2. Add files or folders ", padding=8)
-            fr.grid(row=0, column=1, sticky="nsew")
-            btns = ttk.Frame(fr)
-            btns.pack(fill="x", pady=(0, 6))
-            ttk.Button(btns, text="+ Files", command=self.add_files).pack(side="left")
-            ttk.Button(btns, text="+ Folder", command=self.add_folder).pack(side="left", padx=6)
-            ttk.Button(btns, text="Remove", command=self.remove_sel).pack(side="left")
-            ttk.Button(btns, text="Clear", command=self.clear).pack(side="left", padx=6)
-            self.total_lbl = ttk.Label(btns, text="")
-            self.total_lbl.pack(side="right")
-            tvf = ttk.Frame(fr)
-            tvf.pack(fill="both", expand=True)
-            self.tree = ttk.Treeview(tvf, columns=("size",), show="tree headings", selectmode="extended")
-            self.tree.heading("#0", text="Name")
-            self.tree.heading("size", text="Size")
-            self.tree.column("size", width=100, anchor="e", stretch=False)
-            sb = ttk.Scrollbar(tvf, orient="vertical", command=self.tree.yview)
-            self.tree.configure(yscrollcommand=sb.set)
-            self.tree.pack(side="left", fill="both", expand=True)
-            sb.pack(side="right", fill="y")
-
-            # send + progress
-            sp = ttk.Frame(self.root, padding=(12, 0, 12, 6))
-            sp.pack(fill="x")
-            self.send_btn = ttk.Button(sp, text="3. Send  ▶", style="Big.TButton", command=self.send)
-            self.send_btn.pack(side="left")
-            pf = ttk.Frame(sp)
-            pf.pack(side="left", fill="x", expand=True, padx=(12, 0))
-            self.status = ttk.Label(pf, text="Idle")
-            self.status.pack(anchor="w")
-            self.pbar = ttk.Progressbar(pf, maximum=1000)
-            self.pbar.pack(fill="x", pady=(4, 0))
-
-            # settings
-            sf = ttk.LabelFrame(self.root, text=" Settings ", padding=8)
-            sf.pack(fill="x", padx=12, pady=(0, 6))
-            r1 = ttk.Frame(sf)
-            r1.pack(fill="x")
-            ttk.Label(r1, text="Received files go to:").pack(side="left")
-            self.dir_lbl = ttk.Label(r1, text=self.save_dir, foreground="#2457d6")
-            self.dir_lbl.pack(side="left", padx=6)
-            ttk.Button(r1, text="Change", command=self.change_dir).pack(side="right")
-            ttk.Button(r1, text="Open folder", command=self.open_dir).pack(side="right", padx=6)
-            r2 = ttk.Frame(sf)
-            r2.pack(fill="x", pady=(6, 0))
-            self.ask_var = tk.BooleanVar(value=self.ask_first)
-            ttk.Checkbutton(r2, text="Ask me before receiving", variable=self.ask_var, command=self.save_settings).pack(side="left")
-            self.web_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(r2, text="Phone / browser sharing", variable=self.web_var, command=self.toggle_web).pack(side="left", padx=(18, 6))
-            self.url_var = tk.StringVar(value="(off)")
-            ttk.Entry(r2, textvariable=self.url_var, state="readonly", width=34).pack(side="left")
-            ttk.Button(r2, text="Copy", command=self.copy_url).pack(side="left", padx=4)
-
-            # log
-            lf = ttk.Frame(self.root, padding=(12, 0, 12, 10))
-            lf.pack(fill="x")
-            self.logbox = tk.Text(lf, height=5, font=("Consolas", 9), state="disabled", relief="flat", background="#f4f5f7")
-            self.logbox.pack(fill="x")
-
-        # ---------- thread helpers
-        def pump(self):
-            try:
-                while True:
-                    self.q.get_nowait()()
-            except queue.Empty:
-                pass
-            self.root.after(50, self.pump)
-
-        def log(self, msg):
-            self.logbox.configure(state="normal")
-            self.logbox.insert("end", time.strftime("%H:%M:%S  ") + msg + "\n")
-            self.logbox.see("end")
-            self.logbox.configure(state="disabled")
-
-        def log_threadsafe(self, msg):
-            self.q.put(lambda: self.log(msg))
-
-        def ask(self, man, ip):
-            if not self.ask_first:
-                return True
-            ev, res = threading.Event(), {}
-            n = len(man.get("files", []))
-            names = "\n".join("  • " + f["path"] for f in man["files"][:8]) + ("\n  ..." if n > 8 else "")
-
-            def dlg():
-                self.root.deiconify()
-                self.root.lift()
-                self.root.attributes("-topmost", True)
-                res["ok"] = messagebox.askyesno(
-                    "Incoming files",
-                    f"{man.get('sender', ip)} ({ip}) wants to send you {n} file(s), {human(man.get('total', 0))}:\n\n{names}\n\nAccept?",
-                    parent=self.root)
-                self.root.attributes("-topmost", False)
-                ev.set()
-            self.q.put(dlg)
-            ev.wait(140)
-            return res.get("ok", False)
-
-        def _prog(self, mode, done, total, name):
-            with self.plock:
-                p = self.prog
-                if done < 0:
-                    p.update(err=name, end=time.time(), mode="")
-                    return
-                if p["mode"] != mode or done < p["done"] or total != p["total"]:
-                    p.update(mode=mode, start=time.time(), err=None)
-                p.update(done=done, total=total, name=name)
-                if done >= total:
-                    p.update(end=time.time())
-
-        def recv_cb(self, done, total, name):
-            self._prog("Receiving", done, total, name)
-
-        def web_cb(self, done, total, name):
-            self._prog("Receiving from phone", done, total, name)
-
-        def tick(self):
-            with self.plock:
-                p = dict(self.prog)
-            if p["err"]:
-                self.status.configure(text="Failed: " + p["err"])
-                with self.plock:
-                    self.prog["err"] = None
-            elif p["mode"] and p["total"]:
-                el = max(0.001, (p["end"] or time.time()) - p["start"]) if p["done"] >= p["total"] else max(0.001, time.time() - p["start"])
-                speed = p["done"] / el
-                frac = p["done"] / p["total"]
-                self.pbar["value"] = frac * 1000
-                if p["done"] >= p["total"]:
-                    self.status.configure(text=f"{p['mode']} done ✓  {human(p['total'])} in {el:.1f}s  (avg {human(speed)}/s, {speed*8/1e6:.0f} Mbps)")
-                    with self.plock:
-                        self.prog["mode"] = ""
-                else:
-                    eta = (p["total"] - p["done"]) / speed if speed > 0 else 0
-                    self.status.configure(text=f"{p['mode']}: {os.path.basename(p['name'])}  •  {human(p['done'])} / {human(p['total'])}  •  {human(speed)}/s ({speed*8/1e6:.0f} Mbps)  •  {int(eta)}s left")
-            # refresh device list
-            peers = self.disc.list() if self.disc else []
-            ips = [ip for ip, _ in peers]
-            if ips != self.peer_ips:
-                sel = self.selected_peer()
-                self.peer_list.delete(0, "end")
-                for ip, name in peers:
-                    self.peer_list.insert("end", f"  \U0001F4BB  {name}   ({ip})")
-                self.peer_ips = ips
-                if sel in ips:
-                    self.peer_list.selection_set(ips.index(sel))
-                if not ips:
-                    self.peer_list.insert("end", "  Searching... open FastShare on the other PC")
-            self.me_lbl.configure(text=f"This PC: {HOSTNAME}   •   {local_ip()}")
-            self.root.after(250, self.tick)
-
-        # ---------- files
-        def refresh_files(self):
-            self.tree.delete(*self.tree.get_children())
-            total = 0
-            for i, (p, rel) in enumerate(self.items):
-                try:
-                    s = os.path.getsize(p)
-                except OSError:
-                    s = 0
-                total += s
-                self.tree.insert("", "end", iid=str(i), text=rel, values=(human(s),))
-            self.total_lbl.configure(text=f"{len(self.items)} file(s) • {human(total)}" if self.items else "")
-            self.shared = tuple(self.items)
-
-        def add_files(self):
-            for p in filedialog.askopenfilenames(parent=self.root, title="Choose files to send"):
-                self.items.append((p, os.path.basename(p)))
-            self.refresh_files()
-
-        def add_folder(self):
-            d = filedialog.askdirectory(parent=self.root, title="Choose a folder to send")
-            if d:
-                found = collect_folder(d)
-                if not found:
-                    messagebox.showinfo(APP, "That folder is empty.", parent=self.root)
-                self.items.extend(found)
-                self.refresh_files()
-
-        def remove_sel(self):
-            idx = sorted((int(i) for i in self.tree.selection()), reverse=True)
-            for i in idx:
-                del self.items[i]
-            self.refresh_files()
-
-        def clear(self):
-            self.items = []
-            self.refresh_files()
-
-        # ---------- sending
-        def selected_peer(self):
-            sel = self.peer_list.curselection()
-            if sel and sel[0] < len(self.peer_ips):
-                return self.peer_ips[sel[0]]
-            return None
-
-        def send(self):
-            if self.sending:
+    def choose(self, value):
+        if self.done:
+            return
+        if self.entry_var is not None and value is not None:
+            ok = self.on_result(value, self.entry_var.get().strip())
+            if ok is not True:
+                self.err.configure(text=ok or "")
                 return
-            target = self.ip_var.get().strip() or self.selected_peer()
-            if not target:
-                return messagebox.showwarning(APP, "Pick a device on the left (or type its IP address) first.", parent=self.root)
-            if not self.items:
-                return messagebox.showwarning(APP, "Add some files or a folder first.", parent=self.root)
-            missing = [r for p, r in self.items if not os.path.isfile(p)]
-            if missing:
-                return messagebox.showerror(APP, "These files no longer exist:\n" + "\n".join(missing[:10]), parent=self.root)
-            cfg["last_ip"] = self.ip_var.get().strip()
-            save_config(cfg)
-            items = list(self.items)
-            self.sending = True
-            self.send_btn.configure(state="disabled")
-            self.status.configure(text=f"Waiting for {target} to accept...")
-            self.pbar["value"] = 0
+            self.close()
+            return
+        self.done = True
+        self.close()
+        if self.on_result and self.entry_var is None:
+            self.on_result(value)
 
-            def work():
+    def close(self):
+        self.done = True
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        if self in self.app.dialogs:
+            self.app.dialogs.remove(self)
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
+# ================================================================== app
+class App:
+    def __init__(self, root, theme=None):
+        self.root = root
+        self.q = queue.Queue()
+        self.cfg = load_config()
+        self.P = DARK if (theme or ("dark" if windows_dark() else "light")) == "dark" else LIGHT
+        self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
+        self.save_dir = self.cfg.get("save_dir") or os.path.join(os.path.expanduser("~"), "Downloads", C.APP)
+        self.ask_first = bool(self.cfg.get("ask_first", True))
+        self.manual = {k: v for k, v in (self.cfg.get("manual") or {}).items() if isinstance(k, str)}
+        self.entries = []
+        self.transfers = []
+        self.cards = {}
+        self.order = []
+        self.dialogs = []
+        self.speed = {}
+        self.names = {}
+        self.queue_dirty = True
+        self.toast_until = 0
+        self.awake = False
+        self.after_scan_send = None
+        self.scanning = 0
+
+        root.title("FastShare")
+        root.configure(bg=self.P["bg"])
+        root.geometry(f"{self.S(900)}x{self.S(600)}")
+        root.minsize(self.S(760), self.S(520))
+        root.report_callback_exception = self.on_ui_error
+        self.build()
+        self.dark_titlebar(root)
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.disc = None
+        try:
+            self.disc = C.Discovery()
+            self.disc.start()
+        except OSError as e:
+            log(f"discovery failed: {e}")
+        self.rx = None
+        try:
+            self.rx = C.Receiver(lambda: self.save_dir, self.decide, self.on_rx_event)
+            self.rx.start()
+        except OSError as e:
+            log(f"receiver failed: {e}")
+            self.root.after(500, lambda: self.toast(
+                "Can't receive files: another app is using FastShare's network port. Restart your PC and try again.", "bad", 10))
+        self.pump()
+        self.tick()
+
+    def S(self, n):
+        return int(round(n * self.scale))
+
+    # ---------------------------------------------------------------- layout
+    def build(self):
+        P, S = self.P, self.S
+        hdr = tk.Frame(self.root, bg=P["bg"], padx=S(20), pady=S(14))
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=IC["bolt"], font=(ICONS, 15), bg=P["bg"], fg=P["accent"]).pack(side="left")
+        tk.Label(hdr, text="FastShare", font=(FONT, 15, "bold"), bg=P["bg"], fg=P["text"]).pack(side="left", padx=(S(6), 0))
+        self.net_lbl = tk.Label(hdr, text="", font=(FONT, 9), bg=P["bg"], fg=P["sub"])
+        self.net_lbl.pack(side="right")
+        tk.Label(hdr, text=IC["wifi"], font=(ICONS, 10), bg=P["bg"], fg=P["sub"]).pack(side="right", padx=(0, S(6)))
+
+        body = tk.Frame(self.root, bg=P["bg"], padx=S(20))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=11, uniform="c")
+        body.columnconfigure(1, weight=10, uniform="c")
+        body.rowconfigure(0, weight=1)
+
+        # ---- left: drop zone + queue
+        left = tk.Frame(body, bg=P["bg"])
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, S(16)))
+        self.drop = tk.Canvas(left, height=S(230), bg=P["bg"], highlightthickness=0, cursor="hand2")
+        self.drop.pack(fill="x")
+        self.drop_hot = False
+        self.drop.bind("<Configure>", lambda e: self.draw_drop())
+        self.drop.bind("<ButtonRelease-1>", lambda e: self.pick_files())
+        self.b_files = Btn(self.drop, self, "Select files", self.pick_files)
+        self.b_folder = Btn(self.drop, self, "Select folder", self.pick_folder)
+        if HAVE_DND:
+            for w in (self.root, self.drop):
                 try:
-                    total = send_files(target, items, lambda d, t, n: self._prog("Sending", d, t, n))
-                    self.log_threadsafe(f"Sent {len(items)} file(s), {human(total)} to {target}")
-                except Exception as e:
-                    msg = str(e)
-                    if isinstance(e, (ConnectionRefusedError, socket.timeout, TimeoutError)):
-                        msg = f"Could not reach {target}. Make sure FastShare is open on it and both are on the same Wi-Fi."
-                    self._prog("", -1, 0, msg)
-                    self.log_threadsafe("Send failed: " + msg)
-                finally:
-                    def done():
-                        self.sending = False
-                        self.send_btn.configure(state="normal")
-                    self.q.put(done)
-            threading.Thread(target=work, daemon=True).start()
+                    w.drop_target_register(DND_FILES)
+                    w.dnd_bind("<<Drop>>", lambda e: self.on_drop(e, None))
+                    w.dnd_bind("<<DropEnter>>", lambda e: (self.set_drop_hot(True), e.action)[1])
+                    w.dnd_bind("<<DropLeave>>", lambda e: (self.set_drop_hot(False), e.action)[1])
+                except Exception as ex:
+                    log(f"dnd register failed: {ex}")
 
-        # ---------- settings
-        def save_settings(self):
-            self.ask_first = self.ask_var.get()
-            cfg.update(save_dir=self.save_dir, ask_first=self.ask_first, web_on=self.web_var.get(), web_key=self.web_key)
-            save_config(cfg)
+        qcard = tk.Frame(left, bg=P["card"], highlightthickness=1, highlightbackground=P["border"])
+        qcard.pack(fill="both", expand=True, pady=(S(12), S(12)))
+        qh = tk.Frame(qcard, bg=P["card"], padx=S(14), pady=S(10))
+        qh.pack(fill="x")
+        tk.Label(qh, text="Ready to send", font=(FONT, 10, "bold"), bg=P["card"], fg=P["text"]).pack(side="left")
+        self.clear_btn = Btn(qh, self, "Clear", self.clear_queue, "link")
+        self.clear_btn.pack(side="right")
+        self.q_total = tk.Label(qh, text="", font=(FONT, 9), bg=P["card"], fg=P["sub"])
+        self.q_total.pack(side="right", padx=S(8))
+        self.q_rows = tk.Frame(qcard, bg=P["card"], padx=S(14))
+        self.q_rows.pack(fill="both", expand=True, pady=(0, S(8)))
 
-        def change_dir(self):
-            d = filedialog.askdirectory(parent=self.root, initialdir=self.save_dir, title="Where should received files go?")
-            if d:
-                self.save_dir = os.path.normpath(d)
-                self.dir_lbl.configure(text=self.save_dir)
-                self.save_settings()
+        # ---- right: devices
+        right = tk.Frame(body, bg=P["bg"])
+        right.grid(row=0, column=1, sticky="nsew")
+        rh = tk.Frame(right, bg=P["bg"])
+        rh.pack(fill="x", pady=(0, S(8)))
+        tk.Label(rh, text="Nearby devices", font=(FONT, 11, "bold"), bg=P["bg"], fg=P["text"]).pack(side="left")
+        Btn(rh, self, "+ Add by IP", self.add_by_ip, "link").pack(side="right")
+        self.dev_frame = tk.Frame(right, bg=P["bg"])
+        self.dev_frame.pack(fill="x")
+        self.search = tk.Frame(right, bg=P["bg"], highlightthickness=1, highlightbackground=P["border"])
+        self.search.pack(fill="x", pady=(S(8), 0))
+        self.search_icon = Circle(self.search, self, 40, IC["search"], 13)
+        self.search_icon.set(P["track"], P["sub"], bg=P["bg"])
+        self.search_icon.pack(side="left", padx=(S(12), S(10)), pady=S(10))
+        sf = tk.Frame(self.search, bg=P["bg"])
+        sf.pack(side="left", fill="x", expand=True)
+        self.search_lbl = tk.Label(sf, text="Looking for devices", font=(FONT, 10), bg=P["bg"], fg=P["sub"], anchor="w")
+        self.search_lbl.pack(anchor="w")
+        self.search_hint = tk.Label(sf, text="Open FastShare on the other PC. Both need the same Wi-Fi, set to Private.",
+                                    font=(FONT, 8), bg=P["bg"], fg=P["muted"], anchor="w", justify="left", wraplength=S(300))
+        self.search_hint.pack(anchor="w")
 
-        def open_dir(self):
-            os.makedirs(self.save_dir, exist_ok=True)
-            if sys.platform.startswith("win"):
-                os.startfile(self.save_dir)
-            else:
-                import subprocess
-                subprocess.Popen(["xdg-open" if sys.platform != "darwin" else "open", self.save_dir])
+        # ---- footer
+        foot = tk.Frame(self.root, bg=P["card"], highlightthickness=1, highlightbackground=P["border"], padx=S(20), pady=S(9))
+        foot.pack(fill="x", side="bottom")
+        self.me_lbl = tk.Label(foot, text="", font=(FONT, 9), bg=P["card"], fg=P["sub"])
+        self.me_lbl.pack(side="left")
+        self.ask_var = tk.BooleanVar(value=self.ask_first)
+        tk.Checkbutton(foot, text="Ask before receiving", variable=self.ask_var, command=self.save_settings,
+                       font=(FONT, 9), bg=P["card"], fg=P["sub"], activebackground=P["card"], activeforeground=P["text"],
+                       selectcolor=P["bg"], highlightthickness=0, bd=0, cursor="hand2").pack(side="left", padx=S(24))
+        Btn(foot, self, "Change", self.change_dir, "link").pack(side="right")
+        self.dir_btn = Btn(foot, self, "", lambda: open_folder(self.save_dir), "link")
+        self.dir_btn.pack(side="right", padx=(0, S(10)))
+        tk.Label(foot, text="Saving to", font=(FONT, 9), bg=P["card"], fg=P["sub"]).pack(side="right", padx=(0, S(4)))
+        self.update_dir_label()
 
-        def toggle_web(self):
-            if self.web_var.get() and not self.web:
+        # ---- toast
+        self.toast_frame = tk.Frame(self.root, bg=P["toast"], padx=S(14), pady=S(8))
+        self.toast_lbl = tk.Label(self.toast_frame, text="", bg=P["toast"], fg=P["toast_text"], font=(FONT, 9),
+                                  wraplength=S(560), justify="left")
+        self.toast_lbl.pack(side="left")
+        self.toast_act = tk.Label(self.toast_frame, text="", bg=P["toast"], fg=P["toast_text"],
+                                  font=(FONT, 9, "underline"), cursor="hand2")
+        self.toast_act.pack(side="left", padx=(S(12), 0))
+
+    def draw_drop(self):
+        P, S, c = self.P, self.S, self.drop
+        c.delete("all")
+        w, h, r = c.winfo_width(), c.winfo_height(), S(14)
+        if w < 50:
+            return
+        x0, y0, x1, y1 = 2, 2, w - 2, h - 2
+        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1, x0, y1,
+               x0, y1 - r, x0, y0 + r, x0, y0]
+        c.create_polygon(pts, smooth=True, fill=P["drop_hot"] if self.drop_hot else P["drop"],
+                         outline=P["accent"], dash=(6, 4), width=max(1, S(1.5)))
+        cx, cy = w / 2, h / 2 - S(40)
+        c.create_oval(cx - S(28), cy - S(28), cx + S(28), cy + S(28), fill=P["accent_bg"], outline="")
+        c.create_text(cx, cy, text=IC["download"] if self.drop_hot else IC["upload"], font=(ICONS, 18), fill=P["accent_text"])
+        title = "Drop to add" if self.drop_hot else ("Drop files or folders here" if HAVE_DND else "Choose files or folders")
+        c.create_text(cx, cy + S(46), text=title, font=(FONT, 12, "bold"), fill=P["text"])
+        c.create_text(cx, cy + S(68), text="Any size, straight over your Wi-Fi", font=(FONT, 9), fill=P["sub"])
+        c.create_window(cx - S(6), cy + S(104), window=self.b_files, anchor="e")
+        c.create_window(cx + S(6), cy + S(104), window=self.b_folder, anchor="w")
+
+    def set_drop_hot(self, on):
+        if on != self.drop_hot:
+            self.drop_hot = on
+            self.draw_drop()
+
+    def dark_titlebar(self, win):
+        if C.IS_WIN and self.P is DARK:
+            try:
+                import ctypes
+                win.update_idletasks()
+                hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+                v = ctypes.c_int(1)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(v), 4)
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------- threads -> UI
+    def pump(self):
+        try:
+            for _ in range(200):
+                fn = self.q.get_nowait()
                 try:
-                    self.web = WebShare(self.web_key, lambda: self.shared, lambda: self.save_dir, self.web_cb, self.log_threadsafe)
-                    url = f"http://{local_ip()}:{WEB_PORT}/{self.web_key}"
-                    self.url_var.set(url)
-                    self.log(f"Phone sharing ON - open {url} in your phone's browser (same Wi-Fi).")
+                    fn()
+                except Exception:
+                    self.on_ui_error(*sys.exc_info())
+        except queue.Empty:
+            pass
+        self.root.after(40, self.pump)
+
+    def on_ui_error(self, exc, val, tb):
+        log("UI error:\n" + "".join(traceback.format_exception(exc, val, tb)))
+        self.errors = getattr(self, "errors", []) + ["".join(traceback.format_exception(exc, val, tb))]
+        try:
+            self.toast("Something went wrong. Details were saved to the FastShare log.", "bad")
+        except Exception:
+            pass
+
+    def toast(self, text, tone="info", secs=5, action=None):
+        P = self.P
+        bg = {"bad": P["bad_bg"], "warn": P["warn_bg"], "ok": P["ok_bg"]}.get(tone, P["toast"])
+        fg = {"bad": P["bad"], "warn": P["warn"], "ok": P["ok"]}.get(tone, P["toast_text"])
+        for w in (self.toast_frame, self.toast_lbl, self.toast_act):
+            w.configure(bg=bg)
+        self.toast_lbl.configure(text=text, fg=fg)
+        if action:
+            self.toast_act.configure(text=action[0], fg=fg)
+            self.toast_act.bind("<ButtonRelease-1>", lambda e: (action[1](), self.hide_toast()))
+            self.toast_act.pack(side="left", padx=(self.S(12), 0))
+        else:
+            self.toast_act.pack_forget()
+        self.toast_frame.place(relx=0.5, y=self.S(14), anchor="n")
+        self.toast_frame.lift()
+        self.toast_until = time.time() + secs
+        self.last_toast = text
+
+    def hide_toast(self):
+        self.toast_frame.place_forget()
+        self.toast_until = 0
+
+    # ---------------------------------------------------------------- adding files
+    def pick_files(self):
+        paths = filedialog.askopenfilenames(parent=self.root, title="Choose files to send")
+        if paths:
+            self.add_paths(list(paths))
+        return bool(paths)
+
+    def pick_folder(self):
+        d = filedialog.askdirectory(parent=self.root, title="Choose a folder to send")
+        if d:
+            self.add_paths([d])
+        return bool(d)
+
+    def on_drop(self, event, ip):
+        self.set_drop_hot(False)
+        for card in self.cards.values():
+            card.hover(False)
+        try:
+            paths = [p for p in self.root.tk.splitlist(event.data) if p]
+        except tk.TclError:
+            paths = []
+        if not paths:
+            return getattr(event, "action", None)
+        if ip:
+            self.add_paths(paths, then=lambda new: self.start_send(ip, new))
+        else:
+            self.add_paths(paths)
+        return getattr(event, "action", None)
+
+    def add_paths(self, paths, then=None):
+        """Scan in the background (folders can be huge) then add to the queue or send directly."""
+        self.scanning += 1
+        self.q_total.configure(text="Adding…")
+
+        def work():
+            new, errors = [], []
+            for p in paths:
+                p = os.path.normpath(p)
+                try:
+                    if os.path.isdir(p):
+                        files, dirs = C.collect_folder(p, errors)
+                        size = 0
+                        for ap, _ in files:
+                            try:
+                                size += os.path.getsize(C.L(ap))
+                            except OSError:
+                                errors.append(ap)
+                        new.append(dict(path=p, name=os.path.basename(p) or p, kind="folder", files=files, dirs=dirs,
+                                        size=size, count=len(files)))
+                    elif os.path.isfile(p):
+                        new.append(dict(path=p, name=os.path.basename(p), kind="file", files=[(p, os.path.basename(p))],
+                                        dirs=[], size=os.path.getsize(C.L(p)), count=1))
+                    else:
+                        errors.append(p)
                 except OSError as e:
-                    self.web_var.set(False)
-                    messagebox.showerror(APP, f"Could not start phone sharing on port {WEB_PORT}:\n{e}", parent=self.root)
-            elif not self.web_var.get() and self.web:
-                self.web.stop()
-                self.web = None
-                self.url_var.set("(off)")
-                self.log("Phone sharing OFF.")
+                    errors.append(f"{p}: {e}")
+            self.q.put(lambda: self._added(new, errors, then))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _added(self, new, errors, then):
+        self.scanning -= 1
+        if errors:
+            log("couldn't read: " + "; ".join(errors[:20]))
+            self.toast(f"{len(errors)} item(s) couldn't be read and were left out.", "warn")
+        if then:
+            self.queue_dirty = True
+            if new:
+                then(new)
+            return
+        have = {e["path"] for e in self.entries}
+        added = [e for e in new if e["path"] not in have]
+        self.entries.extend(added)
+        self.queue_dirty = True
+        if added and self.after_scan_send:
+            ip, self.after_scan_send = self.after_scan_send, None
+            self.start_send(ip)
+
+    def remove_entry(self, path):
+        self.entries = [e for e in self.entries if e["path"] != path]
+        self.queue_dirty = True
+
+    def clear_queue(self):
+        self.entries = []
+        self.queue_dirty = True
+
+    def render_queue(self):
+        P, S = self.P, self.S
+        for w in self.q_rows.winfo_children():
+            w.destroy()
+        n = len(self.entries)
+        total = sum(e["size"] for e in self.entries)
+        files = sum(e["count"] for e in self.entries)
+        if self.scanning:
+            self.q_total.configure(text="Adding…")
+        else:
+            self.q_total.configure(text=f"{files} file{'s' if files != 1 else ''} · {C.human(total)}" if n else "")
+        if not n:
+            tk.Label(self.q_rows, text="Add files, then click a device to send them.\nYou can also drop files straight onto a device.",
+                     bg=P["card"], fg=P["muted"], font=(FONT, 9), justify="left").pack(anchor="w", pady=S(6))
+            return
+        MAXROWS = 6
+        for e in self.entries[:MAXROWS]:
+            row = tk.Frame(self.q_rows, bg=P["card"])
+            row.pack(fill="x", pady=S(2))
+            tk.Label(row, text=IC["folder"] if e["kind"] == "folder" else IC["file"], font=(ICONS, 10),
+                     bg=P["card"], fg=P["accent_text"]).pack(side="left", padx=(0, S(8)))
+            label = e["name"] + (f"  ({e['count']} files)" if e["kind"] == "folder" else "")
+            tk.Label(row, text=short(label, 40), bg=P["card"], fg=P["text"], font=(FONT, 9), anchor="w").pack(side="left")
+            x = tk.Label(row, text=IC["close"], font=(ICONS, 8), bg=P["card"], fg=P["muted"], cursor="hand2", padx=S(4))
+            x.pack(side="right")
+            x.bind("<ButtonRelease-1>", lambda ev, p=e["path"]: self.remove_entry(p))
+            tk.Label(row, text=C.human(e["size"]), bg=P["card"], fg=P["sub"], font=(FONT, 9)).pack(side="right", padx=S(6))
+        if n > MAXROWS:
+            tk.Label(self.q_rows, text=f"+ {n - MAXROWS} more", bg=P["card"], fg=P["sub"], font=(FONT, 9)).pack(anchor="w", pady=S(2))
+
+    # ---------------------------------------------------------------- sending
+    def peer_name(self, ip):
+        if self.disc and ip in self.disc.list():
+            return self.disc.list()[ip]
+        return self.names.get(ip) or self.manual.get(ip) or ip
+
+    def on_card_click(self, ip):
+        busy = [t for t in self.transfers if t.ip == ip and not t.finished]
+        if busy:
+            return self.toast(f"Already busy with {self.peer_name(ip)}. Click the ✕ on its card to cancel.", "warn")
+        if self.scanning:
+            self.after_scan_send = ip
+            return
+        if not self.entries:
+            self.after_scan_send = ip
+            if not self.pick_files():
+                self.after_scan_send = None
+            return
+        self.start_send(ip)
+
+    def start_send(self, ip, entries=None):
+        entries = entries if entries is not None else list(self.entries)
+        if not entries:
+            return
+        if [t for t in self.transfers if t.ip == ip and t.direction == "send" and not t.finished]:
+            return self.toast(f"Already sending to {self.peer_name(ip)}.", "warn")
+        items, dirs = [], []
+        for e in entries:
+            items.extend(e["files"])
+            dirs.extend(e["dirs"])
+        tr = C.Transfer("send", ip, self.peer_name(ip))
+        self.transfers.append(tr)
+        threading.Thread(target=C.send_files, args=(ip, items, dirs, tr), daemon=True).start()
+
+    def cancel_for(self, ip):
+        for t in self.transfers:
+            if t.ip == ip and not t.finished:
+                t.cancel()
+
+    # ---------------------------------------------------------------- receiving (called from receiver threads)
+    def on_rx_event(self, kind, tr):
+        if kind == "new":
+            self.q.put(lambda: (self.transfers.append(tr), self.names.__setitem__(tr.ip, tr.peer)))
+
+    def decide(self, tr, man, dups):
+        ask = self.ask_first
+        if not ask and not dups:
+            p = C.Pending(("accept", set()))
+            p.event.set()
+            return p
+        p = C.Pending(("decline", None) if ask else ("accept", set(dups)))
+        self.q.put(lambda: self.show_incoming(tr, man, dups, p, ask))
+        return p
+
+    def show_incoming(self, tr, man, dups, pend, ask):
+        if pend.event.is_set():
+            return
+        files = man["files"]
+        n, k = len(files), len(dups)
+        dupset = set(dups)
+        names = [(f["path"], "Already downloaded" if i in dupset else "") for i, f in enumerate(files[:6])]
+        if n > 6:
+            names.append((f"+ {n - 6} more", ""))
+        accept_all, skip_dups, decline = ("accept", frozenset()), ("accept", frozenset(dups)), ("decline", None)
+        heading = f"{tr.peer} wants to send you {n} file{'s' if n != 1 else ''}" if n else f"{tr.peer} wants to send you folders"
+        sub = f"{C.human(man['total'])}  ·  from {tr.ip}"
+        note = None
+        if k == n and n:
+            note = "You've already downloaded " + ("this file." if n == 1 else "all of these files.") + " They're in your FastShare folder."
+        elif k:
+            note = f"{k} of these {'is' if k == 1 else 'are'} already downloaded."
+        if not k:
+            buttons = (("Decline", decline, "secondary"), ("Accept", accept_all, "primary"))
+        elif k == n:
+            buttons = ((("Decline", decline, "secondary"),) if ask else ()) + \
+                      (("Download again", accept_all, "secondary"), ("Skip", skip_dups, "primary"))
+        else:
+            buttons = ((("Decline", decline, "secondary"),) if ask else ()) + \
+                      (("Download all again", accept_all, "secondary"), ("Accept new only", skip_dups, "primary"))
+        close_value = pend.result
+        d = Dialog(self, heading, sub, IC["download"], "warn" if k else "accent", names, note, buttons,
+                   on_result=lambda v: pend.answer((v[0], set(v[1] or ())) if v else close_value),
+                   close_value=close_value, timeout=C.ACCEPT_WAIT,
+                   timeout_text=("Declines automatically in {}s" if ask else "Skips duplicates automatically in {}s"))
+        pend.close = lambda: self.q.put(d.close)
+
+        def watch():
+            if d.done:
+                return
+            if pend.event.is_set() or tr.finished:
+                d.close()
+            else:
+                d.after(300, watch)
+        watch()
+        self.flash()
+
+    def flash(self):
+        if C.IS_WIN:
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+                ctypes.windll.user32.FlashWindow(hwnd, True)
+            except Exception:
+                pass
+        try:
+            self.root.deiconify()
+        except tk.TclError:
+            pass
+
+    # ---------------------------------------------------------------- results
+    def announce(self, t):
+        t.announced = True
+        peer = t.peer
+        if t.direction == "send":
+            if t.state == "done":
+                if t.skipped:
+                    sent = t.files - len(t.skipped)
+                    one = len(t.skipped) == 1
+                    heading = (f"{peer} already has " + ("this file" if one else "these files")) if not sent else \
+                        f"Sent {sent} file{'s' if sent != 1 else ''}. {len(t.skipped)} {'was' if one else 'were'} already downloaded"
+                    names = [(os.path.basename(p) or p, "Already downloaded") for p in t.skipped[:6]]
+                    if len(t.skipped) > 6:
+                        names.append((f"+ {len(t.skipped) - 6} more", ""))
+                    Dialog(self, heading, "Files that are already on the other PC are skipped, so nothing is copied twice.",
+                           IC["info"], "warn", names, buttons=(("OK", None, "primary"),))
+                else:
+                    dt = max(0.001, t.end - t.start)
+                    self.toast(f"Sent to {peer}  ·  {C.human(t.total)} in {C.human_time(dt)} "
+                               f"({C.human(t.total / dt)}/s)", "ok")
+            elif t.state == "declined":
+                self.toast(t.msg or f"{peer} declined.", "warn")
+            elif t.state == "error":
+                self.toast(t.msg, "bad", 8)
+        else:
+            if t.state == "done":
+                got = t.files - len(t.skipped)
+                extra = f" ({len(t.skipped)} already downloaded, skipped)" if t.skipped else ""
+                self.toast(f"Received {got} file{'s' if got != 1 else ''} from {peer}{extra}", "ok", 7,
+                           ("Open folder", lambda d=t.save_dir: open_folder(d)))
+            elif t.state == "error":
+                self.toast(t.msg, "bad", 8)
+            elif t.state == "cancelled" and t.msg and t.msg != "Cancelled":
+                self.toast(t.msg, "warn")
+
+    def card_info(self, ip, online):
+        """-> (status text, colour key, circle bg key, pct or None, cancellable)"""
+        P = self.P
+        trs = [t for t in self.transfers if t.ip == ip]
+        active = [t for t in trs if not t.finished]
+        now = time.time()
+        if active:
+            t = active[-1]
+            if t.state == "preparing":
+                return "Getting files ready…", "sub", "track", None, True
+            if t.state == "connecting":
+                return "Connecting…", "sub", "track", None, True
+            if t.state == "waiting":
+                if t.direction == "send":
+                    return "Waiting for them to accept…", "warn", "warn_bg", None, True
+                return f"Wants to send you {t.files} file{'s' if t.files != 1 else ''}", "warn", "warn_bg", None, True
+            pct = t.done / t.total if t.total else 1.0
+            last = self.speed.get(t.id)
+            if last is None or now - last[0] >= 0.5:
+                inst = (t.done - last[1]) / (now - last[0]) if last else 0
+                ema = inst if not last or last[2] == 0 else last[2] * 0.6 + inst * 0.4
+                self.speed[t.id] = (now, t.done, ema)
+            sp = self.speed[t.id][2]
+            eta = f" · {C.human_time((t.total - t.done) / sp)} left" if sp > 0 and t.done < t.total else ""
+            verb = "Sending" if t.direction == "send" else "Receiving"
+            return f"{verb} {int(pct * 100)}% · {C.human(sp)}/s{eta}", "accent_text", "accent_bg", pct, True
+        recent = [t for t in trs if t.finished and now - t.end < 10]
+        if recent:
+            t = recent[-1]
+            if t.state == "done":
+                if t.direction == "send":
+                    msg = "Already had these files" if t.skipped and t.total == 0 else "Sent ✓"
+                else:
+                    msg = "Received ✓"
+                return msg, "ok", "ok_bg", None, False
+            if t.state == "declined":
+                return ("Declined" if t.direction == "send" else "You declined"), "bad", "bad_bg", None, False
+            if t.state == "cancelled":
+                return "Cancelled", "sub", "track", None, False
+            return short(t.msg or "Failed", 46), "bad", "bad_bg", None, False
+        if online:
+            return "Ready · click to send", "ok", "ok_bg", None, False
+        return "Not found right now · click to try", "muted", "track", None, False
+
+    # ---------------------------------------------------------------- periodic refresh
+    def tick(self):
+        try:
+            self._tick()
+        except Exception:
+            self.on_ui_error(*sys.exc_info())
+        self.root.after(150, self.tick)
+
+    def _tick(self):
+        P = self.P
+        now = time.time()
+        online = self.disc.list() if self.disc else {}
+        for ip, nm in online.items():
+            self.names[ip] = nm
+        recent_ips = [t.ip for t in self.transfers if not t.finished or now - t.end < 60]
+        ips = set(online) | set(self.manual) | set(recent_ips)
+        order = sorted(ips, key=lambda ip: (ip not in online, self.peer_name(ip).lower()))
+        if order != self.order:
+            for ip in list(self.cards):
+                if ip not in ips:
+                    self.cards.pop(ip).destroy()
+            for ip in order:
+                if ip not in self.cards:
+                    self.cards[ip] = DeviceCard(self, self.dev_frame, ip)
+                self.cards[ip].pack_forget()
+            for ip in order:
+                self.cards[ip].pack(fill="x", pady=(0, self.S(8)))
+            self.order = order
+        for ip, card in self.cards.items():
+            status, fg, cbg, pct, canc = self.card_info(ip, ip in online)
+            glyph = IC["laptop"]
+            card.update_view(self.peer_name(ip), status, P[fg], P[cbg], glyph, pct, canc)
+        dots = "." * (int(now * 2) % 4)
+        self.search_lbl.configure(text=("Looking for more devices" if online else "Looking for devices") + dots)
+        self.search_hint.configure(text="Open FastShare on the other PC. Both need the same Wi-Fi, set to Private." if not online
+                                   else "Drop files on a device to send them right away.")
+
+        for t in self.transfers:
+            if t.finished and not t.announced:
+                self.announce(t)
+        self.transfers = [t for t in self.transfers if not t.finished or now - t.end < 120]
+        live = {t.id for t in self.transfers}
+        self.speed = {k: v for k, v in self.speed.items() if k in live}
+
+        busy = any(not t.finished for t in self.transfers)
+        if busy != self.awake:
+            self.awake = busy
+            keep_awake(busy)
+        if self.queue_dirty:
+            self.queue_dirty = False
+            self.render_queue()
+        if self.toast_until and now > self.toast_until:
+            self.hide_toast()
+        if now - getattr(self, "_ip_at", 0) > 5:
+            self._ip_at, self._ip = now, C.local_ip()
+        ip = self._ip
+        self.me_lbl.configure(text=f"Visible as {C.HOSTNAME}")
+        self.net_lbl.configure(text=ip if not ip.startswith("127.") else "Not connected to a network")
+
+    # ---------------------------------------------------------------- settings / misc
+    def save_settings(self):
+        self.ask_first = bool(self.ask_var.get())
+        self.cfg.update(save_dir=self.save_dir, ask_first=self.ask_first, manual=self.manual)
+        save_config(self.cfg)
+
+    def update_dir_label(self):
+        d = self.save_dir
+        home = os.path.expanduser("~")
+        shown = d.replace(home, "~", 1) if d.startswith(home) else d
+        self.dir_btn.configure(text=short(shown, 38))
+
+    def change_dir(self):
+        d = filedialog.askdirectory(parent=self.root, initialdir=self.save_dir, title="Where should received files go?")
+        if d:
+            test = os.path.join(d, ".fastshare_write_test")
+            try:
+                with open(C.L(test), "w") as f:
+                    f.write("x")
+                os.remove(C.L(test))
+            except OSError:
+                return self.toast("FastShare can't save files in that folder. Pick another one.", "bad")
+            self.save_dir = os.path.normpath(d)
+            self.update_dir_label()
             self.save_settings()
 
-        def copy_url(self):
-            self.root.clipboard_clear()
-            self.root.clipboard_append(self.url_var.get())
+    def add_by_ip(self):
+        def done(_, text):
+            if not valid_host(text):
+                return "That doesn't look like an IP address, e.g. 192.168.1.20"
+            if text in C.local_ips() and text not in ("127.0.0.1",):
+                return "That's this PC's own address."
+            self.manual[text] = self.manual.get(text) or text
+            self.save_settings()
+            return True
+        Dialog(self, "Add a device by IP address", "Find it on the other PC: FastShare shows it at the top right.",
+               IC["add"], "accent", buttons=(("Cancel", None, "secondary"), ("Add", "add", "primary")),
+               on_result=done, entry="")
 
-    root = tk.Tk()
-    App(root)
+    def card_menu(self, ip, e):
+        P = self.P
+        m = tk.Menu(self.root, tearoff=0, bg=P["card"], fg=P["text"], activebackground=P["accent"], activeforeground="#fff")
+        m.add_command(label="Send files…", command=lambda: self.on_card_click(ip))
+        if [t for t in self.transfers if t.ip == ip and not t.finished]:
+            m.add_command(label="Cancel transfer", command=lambda: self.cancel_for(ip))
+        if ip in self.manual:
+            m.add_command(label="Remove device", command=lambda: (self.manual.pop(ip, None), self.save_settings()))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def on_close(self, force=False):
+        busy = [t for t in self.transfers if not t.finished]
+        if busy and not force:
+            return Dialog(self, "Transfers are still running", "If you quit now they'll stop and unfinished files are removed.",
+                          IC["warn"], "warn", buttons=(("Keep open", None, "secondary"), ("Quit anyway", "quit", "primary")),
+                          on_result=lambda v: self.on_close(True) if v == "quit" else None)
+        for t in busy:
+            t.cancel()
+        try:
+            if self.disc:
+                self.disc.bye()
+            if self.rx:
+                self.rx.stop()
+        except Exception:
+            pass
+        keep_awake(False)
+        time.sleep(0.2 if busy else 0)
+        self.root.destroy()
+
+
+# ================================================================== entry point
+def single_instance():
+    if not C.IS_WIN or os.environ.get("FASTSHARE_SELFTEST"):
+        return True
+    try:
+        import ctypes
+        ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\FastShareSingleInstance")
+        if ctypes.windll.kernel32.GetLastError() == 183:
+            ctypes.windll.user32.MessageBoxW(None, "FastShare is already open. Look for it on the taskbar.", "FastShare", 0x40)
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def main():
+    if not single_instance():
+        return
+    if C.IS_WIN:
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+    root = TkinterDnD.Tk() if HAVE_DND else tk.Tk()
+    app = App(root, os.environ.get("FASTSHARE_THEME"))
+    if os.environ.get("FASTSHARE_SELFTEST"):
+        import selftest
+        selftest.run(app, os.environ["FASTSHARE_SELFTEST"], os.environ.get("FASTSHARE_SHOTS"))
     root.mainloop()
 
 
 if __name__ == "__main__":
-    run_gui()
+    try:
+        main()
+    except Exception:
+        log("fatal:\n" + traceback.format_exc())
+        raise
