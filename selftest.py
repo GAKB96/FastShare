@@ -59,6 +59,10 @@ def run(app, out_path, shots_dir=None):
         except Exception as e:
             check("screenshot " + name, False, e)
 
+    def settle(ms=500):
+        until = time.time() + ms / 1000
+        return "settle", lambda: time.time() > until, 5
+
     def dialog(contains):
         for d in app.dialogs:
             if contains.lower() in d.kind.lower():
@@ -96,6 +100,7 @@ def run(app, out_path, shots_dir=None):
         yield "same file dropped twice", lambda: not app.scanning, 10
         check("no duplicate rows in queue", len(app.entries) == 3, len(app.entries))
         yield "device card shown", lambda: ME in app.cards, 10
+        yield settle()
         shot("1_main")
 
         # 3. first send -> incoming popup -> Accept
@@ -103,6 +108,7 @@ def run(app, out_path, shots_dir=None):
         yield "incoming popup", lambda: dialog("wants to send"), 30
         d = dialog("wants to send")
         check("incoming popup has Accept/Decline", set(d.buttons) == {"Accept", "Decline"}, list(d.buttons))
+        yield settle()
         shot("2_incoming")
         press(d, "Accept")
         yield "first send finished", lambda: last_send() and last_send().finished, 120
@@ -113,6 +119,7 @@ def run(app, out_path, shots_dir=None):
         check("folder structure kept", os.path.exists(os.path.join(recv, "Album", "sub", "x.raw")) and os.path.isdir(os.path.join(recv, "Album", "Empty")))
         check("no leftover .part files", not [f for r, _, fs in os.walk(recv) for f in fs if f.endswith(".part")])
         yield "success message", lambda: "Received" in (getattr(app, "last_toast", "") or "") or "Sent" in (getattr(app, "last_toast", "") or ""), 10
+        yield settle()
         shot("3_sent")
 
         # 4. same files again -> duplicate popup -> Skip -> sender is told
@@ -120,9 +127,11 @@ def run(app, out_path, shots_dir=None):
         yield "duplicate popup", lambda: dialog("wants to send"), 30
         d = dialog("wants to send")
         check("duplicate popup offers Skip / Download again", {"Skip", "Download again"} <= set(d.buttons), list(d.buttons))
+        yield settle()
         shot("4_duplicate")
         press(d, "Skip")
         yield "sender told files already there", lambda: dialog("already has"), 30
+        yield settle()
         shot("5_already_has")
         check("sender popup lists skipped files", len(last_send().skipped) == 3, last_send().skipped)
         dialog("already has").choose(None)
@@ -166,7 +175,8 @@ def run(app, out_path, shots_dir=None):
         app.on_card_click(ME)
         yield "popup for big file", lambda: dialog("wants to send"), 60
         press(dialog("wants to send"), "Accept")
-        yield "big transfer running", lambda: last_send().state == "active" and last_send().done > 30 * C.MB or last_send().finished, 60
+        yield "big transfer running", lambda: last_send().state == "active" and last_send().done > 300 * C.MB or last_send().finished, 60
+        yield settle()
         shot("6_sending")
         if not last_send().finished:
             app.cancel_for(ME)
@@ -226,6 +236,7 @@ def run(app, out_path, shots_dir=None):
         d.entry_var.set("hello world")
         d.choose("add")
         check("bad IP rejected with message", dialog("Add a device") is not None and "IP address" in d.err["text"], d.err["text"])
+        yield settle()
         shot("7_add_ip")
         d.entry_var.set("10.0.0.99")
         d.choose("add")
@@ -251,7 +262,7 @@ def run(app, out_path, shots_dir=None):
     def finish():
         try:
             with open(out_path, "w", encoding="utf-8") as f:
-                json.dump({"theme": "dark" if app.P is F.DARK else "light", "seconds": round(time.time() - started, 1),
+                json.dump({"theme": "dark" if app.P["bg"] == F.DARK["bg"] else "light", "seconds": round(time.time() - started, 1),
                            "results": results}, f, indent=2)
         finally:
             shutil.rmtree(base, ignore_errors=True)

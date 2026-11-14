@@ -675,7 +675,7 @@ class App:
             row.pack(fill="x", pady=S(2))
             tk.Label(row, text=IC["folder"] if e["kind"] == "folder" else IC["file"], font=(ICONS, 10),
                      bg=P["card"], fg=P["accent_text"]).pack(side="left", padx=(0, S(8)))
-            label = e["name"] + (f"  ({e['count']} files)" if e["kind"] == "folder" else "")
+            label = e["name"] + (f"  ({e['count']} file{'s' if e['count'] != 1 else ''})" if e["kind"] == "folder" else "")
             tk.Label(row, text=short(label, 40), bg=P["card"], fg=P["text"], font=(FONT, 9), anchor="w").pack(side="left")
             x = tk.Label(row, text=IC["close"], font=(ICONS, 8), bg=P["card"], fg=P["muted"], cursor="hand2", padx=S(4))
             x.pack(side="right")
@@ -819,10 +819,13 @@ class App:
                 self.toast(t.msg, "bad", 8)
         else:
             if t.state == "done":
-                got = t.files - len(t.skipped)
-                extra = f" ({len(t.skipped)} already downloaded, skipped)" if t.skipped else ""
-                self.toast(f"Received {got} file{'s' if got != 1 else ''} from {peer}{extra}", "ok", 7,
-                           ("Open folder", lambda d=t.save_dir: open_folder(d)))
+                got, sk = t.files - len(t.skipped), len(t.skipped)
+                if got:
+                    extra = f" ({sk} already downloaded, skipped)" if sk else ""
+                    text = f"Received {got} file{'s' if got != 1 else ''} from {peer}{extra}"
+                else:
+                    text = f"Skipped {sk} file{'s' if sk != 1 else ''} from {peer}: you already have {'it' if sk == 1 else 'them'}"
+                self.toast(text, "ok", 7, ("Open folder", lambda d=t.save_dir: open_folder(d)))
             elif t.state == "error":
                 self.toast(t.msg, "bad", 8)
             elif t.state == "cancelled" and t.msg and t.msg != "Cancelled":
@@ -835,7 +838,8 @@ class App:
         active = [t for t in trs if not t.finished]
         now = time.time()
         if active:
-            t = active[-1]
+            rank = {"active": 3, "waiting": 2}
+            t = max(active, key=lambda x: (rank.get(x.state, 1), x.id))
             if t.state == "preparing":
                 return "Getting files ready…", "sub", "track", None, True
             if t.state == "connecting":
