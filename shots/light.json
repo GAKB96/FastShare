@@ -1,0 +1,151 @@
+{
+  "theme": "light",
+  "seconds": 38.1,
+  "results": [
+    {
+      "name": "window opened",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "drag and drop support loaded",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "receiver listening",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "discovery running",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "folder counted",
+      "ok": true,
+      "detail": "{'path': 'C:\\\\Users\\\\RUNNER~1\\\\AppData\\\\Local\\\\Temp\\\\fs_selftest___wg739k\\\\src\\\\Album', 'name': 'Album', 'kind': 'folder', 'files': [('C:\\\\Users\\\\RUNNER~1\\\\AppData\\\\Local\\\\Temp\\\\fs_selftest___wg739k\\\\src\\\\Album\\\\sub\\\\x.raw', 'Album\\\\sub\\\\x.raw')], 'dirs': ['Album\\\\Empty'], 'size': 3145728, 'count': 1}"
+    },
+    {
+      "name": "no duplicate rows in queue",
+      "ok": true,
+      "detail": "3"
+    },
+    {
+      "name": "incoming popup has Accept/Decline",
+      "ok": true,
+      "detail": "['Accept', 'Decline']"
+    },
+    {
+      "name": "first send done",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "video arrived intact",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "photo with space arrived",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "folder structure kept",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "no leftover .part files",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "duplicate popup offers Skip / Download again",
+      "ok": true,
+      "detail": "['Skip', 'Download again', 'Decline']"
+    },
+    {
+      "name": "sender popup lists skipped files",
+      "ok": true,
+      "detail": "['photo one.jpg', 'video.mp4', 'Album/sub/x.raw']"
+    },
+    {
+      "name": "nothing copied twice",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "download again keeps both copies",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "partial popup offers Accept new only",
+      "ok": true,
+      "detail": "['Accept new only', 'Download all again', 'Decline']"
+    },
+    {
+      "name": "only the new file copied",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "decline reported to sender",
+      "ok": true,
+      "detail": "declined"
+    },
+    {
+      "name": "cancel stops sender",
+      "ok": true,
+      "detail": "cancelled"
+    },
+    {
+      "name": "cancel removes unfinished file",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "ask off: received without popup",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "ask off duplicate popup has no Decline",
+      "ok": true,
+      "detail": "['Skip', 'Download again']"
+    },
+    {
+      "name": "missing file explained",
+      "ok": true,
+      "detail": "'gone.txt' can't be found. It may have been moved or deleted."
+    },
+    {
+      "name": "unreachable device explained",
+      "ok": true,
+      "detail": "Couldn't reach Offline PC. Check FastShare is open there and you're on the same Wi-Fi."
+    },
+    {
+      "name": "bad IP rejected with message",
+      "ok": true,
+      "detail": "That doesn't look like an IP address, e.g. 192.168.1.20"
+    },
+    {
+      "name": "good IP added",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "window still open after Keep open",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "no UI errors",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}
