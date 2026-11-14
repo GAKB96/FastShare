@@ -18,18 +18,18 @@ except Exception:
 
 FONT = "Segoe UI"
 ICONS = "Segoe MDL2 Assets"
-IC = dict(bolt="", upload="", download="", folder="", file="",
+IC = dict(eye="\uE7B3", shield="\uEA18", bolt="", upload="", download="", folder="", file="",
           laptop="", pc="", close="", check="", wifi="", add="",
           search="", warn="", info="", error="", open="")
 
-LIGHT = dict(bg="#f3f3f3", card="#ffffff", border="#e2e2e2", text="#1b1b1b", sub="#5c5c5c", muted="#8a8a8a",
+LIGHT = dict(bg="#f3f3f3", card="#ffffff", border="#dcdcdc", text="#1b1b1b", sub="#5c5c5c", muted="#8a8a8a",
              accent="#2563eb", accent_bg="#e7eefc", accent_text="#1d4ed8", on_accent="#ffffff",
              ok="#107c10", ok_bg="#e5f3e5", warn="#9a5b00", warn_bg="#fcf0da", bad="#c42b1c", bad_bg="#fde7e9",
-             drop="#f7f9ff", drop_hot="#e2eafc", track="#e6e6e6", hover="#f5f7fb", toast="#2b2b2b", toast_text="#ffffff")
-DARK = dict(bg="#1c1c1c", card="#2a2a2a", border="#3a3a3a", text="#f2f2f2", sub="#b4b4b4", muted="#8c8c8c",
-            accent="#3b82f6", accent_bg="#22314b", accent_text="#9cc0ff", on_accent="#ffffff",
-            ok="#6ccb5f", ok_bg="#1e3320", warn="#f0c35a", warn_bg="#3a2f16", bad="#ff99a4", bad_bg="#45242a",
-            drop="#232831", drop_hot="#2b3a55", track="#3a3a3a", hover="#303540", toast="#f2f2f2", toast_text="#1b1b1b")
+             drop="#f7f9ff", drop_hot="#e2eafc", drop_line="#7ea3ee", track="#e6e6e6", hover="#f5f7fb", toast="#2b2b2b", toast_text="#ffffff")
+DARK = dict(bg="#1b1b1b", card="#1f1f1f", border="#383838", text="#f2f2f2", sub="#b9b9b9", muted="#8c8c8c",
+            accent="#3b82f6", accent_bg="#0f2647", accent_text="#6ea8ff", on_accent="#ffffff",
+            ok="#4cc25f", ok_bg="#12301b", warn="#e8a33d", warn_bg="#3a240f", bad="#ff99a4", bad_bg="#45242a",
+            drop="#1b2430", drop_hot="#1f3352", drop_line="#2f5a96", track="#2c2c2c", hover="#2a2a2a", toast="#f2f2f2", toast_text="#1b1b1b")
 
 
 # ------------------------------------------------------------------ small Windows helpers
@@ -99,6 +99,29 @@ def keep_awake(on):
             pass
 
 
+def round_rect(c, x0, y0, x1, y1, r, **kw):
+    r = max(1, min(r, (x1 - x0) / 2, (y1 - y0) / 2))
+    pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1, x0, y1,
+           x0, y1 - r, x0, y0 + r, x0, y0]
+    return c.create_polygon(pts, smooth=True, **kw)
+
+
+def wifi_name():
+    """Name of the connected Wi-Fi, or None (Ethernet, no Wi-Fi, or Windows hides it)."""
+    if not C.IS_WIN:
+        return None
+    try:
+        out = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True, text=True,
+                             timeout=4, creationflags=0x08000000, errors="replace").stdout
+        for line in out.splitlines():
+            k, _, v = line.partition(":")
+            if k.strip() == "SSID" and v.strip():
+                return v.strip()
+    except Exception:
+        pass
+    return None
+
+
 def short(s, n):
     return s if len(s) <= n else s[:n - 1] + "…"
 
@@ -113,27 +136,96 @@ def valid_host(s):
 
 
 # ================================================================== widgets
-class Btn(tk.Label):
-    def __init__(self, parent, app, text, command, kind="secondary", icon=None, size=10):
-        P = app.P
-        self.kind, self.P, self.command = kind, P, command
-        super().__init__(parent, text=text, cursor="hand2", font=(FONT, size, "bold" if kind == "primary" else "normal"),
-                         padx=app.S(14), pady=app.S(6), highlightthickness=1 if kind == "secondary" else 0)
+class Btn(tk.Canvas):
+    """Rounded button. kind = primary | secondary | link"""
+
+    def __new__(cls, parent, app, text, command, kind="secondary", icon=None, size=10, bg=None):
+        if kind == "link":
+            return Link(parent, app, text, command)
+        return super().__new__(cls)
+
+    def __init__(self, parent, app, text, command, kind="secondary", icon=None, size=10, bg=None):
+        import tkinter.font as tkfont
+        self.app, self.P, self.kind, self.command = app, app.P, kind, command
+        S = app.S
+        f = tkfont.Font(family=FONT, size=size, weight="bold" if kind == "primary" else "normal")
+        tw = f.measure(text)
+        iw = S(22) if icon else 0
+        self.w, self.h = tw + iw + S(32), S(36)
+        super().__init__(parent, width=self.w, height=self.h, highlightthickness=0, cursor="hand2",
+                         bg=bg or parent["bg"])
+        self.shape = round_rect(self, 1, 1, self.w - 1, self.h - 1, S(8), width=1)
+        x = S(16)
+        self.icon = None
+        if icon:
+            self.icon = self.create_text(x, self.h / 2, text=icon, font=(ICONS, size), anchor="w")
+            x += iw
+        self.label = self.create_text(x, self.h / 2, text=text, font=f, anchor="w")
         self.paint(False)
         self.bind("<Enter>", lambda e: self.paint(True))
         self.bind("<Leave>", lambda e: self.paint(False))
         self.bind("<ButtonRelease-1>", lambda e: self.command() if self.command else None)
 
+    def set_bg(self, color):
+        self.configure(bg=color)
+
     def paint(self, hot):
         P = self.P
         if self.kind == "primary":
-            self.configure(bg=P["accent_text"] if hot else P["accent"], fg=P["on_accent"])
-        elif self.kind == "link":
-            self.configure(bg=self.master["bg"], fg=P["accent_text"], padx=2, pady=0,
-                           font=(FONT, 9, "underline" if hot else "normal"))
+            fill, fg, line = (P["accent_text"] if hot else P["accent"]), P["on_accent"], ""
         else:
-            self.configure(bg=P["hover"] if hot else P["card"], fg=P["text"],
-                           highlightbackground=P["border"], highlightcolor=P["border"])
+            fill, fg, line = (P["hover"] if hot else P["card"]), P["text"], (P["accent"] if hot else P["border"])
+        self.itemconfigure(self.shape, fill=fill, outline=line)
+        self.itemconfigure(self.label, fill=fg)
+        if self.icon:
+            self.itemconfigure(self.icon, fill=fg if self.kind == "primary" else P["accent_text"])
+
+
+class Link(tk.Label):
+    def __init__(self, parent, app, text, command):
+        self.P = app.P
+        super().__init__(parent, text=text, cursor="hand2", bg=parent["bg"], fg=app.P["accent_text"],
+                         font=(FONT, 10), padx=2, pady=0)
+        self.bind("<Enter>", lambda e: self.configure(font=(FONT, 10, "underline")))
+        self.bind("<Leave>", lambda e: self.configure(font=(FONT, 10)))
+        self.bind("<ButtonRelease-1>", lambda e: command() if command else None)
+
+
+class RoundCard(tk.Canvas):
+    """A frame with rounded corners. Put widgets in .inner"""
+
+    def __init__(self, parent, app, fill, outline, radius=12, dash=None, stretch=False):
+        super().__init__(parent, bg=parent["bg"], highlightthickness=0, height=app.S(20))
+        self.app, self.r, self.fill, self.outline, self.dash, self.stretch = app, app.S(radius), fill, outline, dash, stretch
+        self.pad = max(2, int(self.r * 0.32))
+        self.inner = tk.Frame(self, bg=fill)
+        self.win = self.create_window(self.pad, self.pad, window=self.inner, anchor="nw")
+        self.shape = None
+        self.bind("<Configure>", self._redraw)
+        if not stretch:
+            self.inner.bind("<Configure>", self._fit)
+
+    def _fit(self, e=None):
+        h = self.inner.winfo_reqheight() + 2 * self.pad
+        if int(float(self["height"])) != h:
+            self.configure(height=h)
+
+    def _redraw(self, e=None):
+        w, h = self.winfo_width(), self.winfo_height()
+        if self.shape:
+            self.delete(self.shape)
+        self.shape = round_rect(self, 1, 1, w - 1, h - 1, self.r, fill=self.fill, outline=self.outline,
+                                dash=self.dash, width=1)
+        self.tag_lower(self.shape)
+        self.itemconfigure(self.win, width=max(1, w - 2 * self.pad))
+        if self.stretch:
+            self.itemconfigure(self.win, height=max(1, h - 2 * self.pad))
+
+    def set_outline(self, color):
+        if color != self.outline:
+            self.outline = color
+            if self.shape:
+                self.itemconfigure(self.shape, outline=color)
 
 
 class Circle(tk.Canvas):
@@ -152,24 +244,27 @@ class Circle(tk.Canvas):
             self.configure(bg=bg)
 
 
-class DeviceCard(tk.Frame):
+class DeviceCard(RoundCard):
     def __init__(self, app, parent, ip):
-        P = app.P
-        super().__init__(parent, bg=P["card"], highlightthickness=1, highlightbackground=P["border"], cursor="hand2")
-        self.app, self.ip, self.hot = app, ip, False
-        self.columnconfigure(1, weight=1)
-        self.icon = Circle(self, app, 40, IC["laptop"], 14)
-        self.icon.grid(row=0, column=0, rowspan=2, padx=(app.S(12), app.S(10)), pady=app.S(10))
-        self.name = tk.Label(self, bg=P["card"], fg=P["text"], font=(FONT, 10, "bold"), anchor="w")
-        self.name.grid(row=0, column=1, sticky="sw", pady=(app.S(10), 0))
-        self.status = tk.Label(self, bg=P["card"], fg=P["sub"], font=(FONT, 9), anchor="w")
-        self.status.grid(row=1, column=1, sticky="nw", pady=(0, app.S(10)))
-        self.x = tk.Label(self, text=IC["close"], font=(ICONS, 9), bg=P["card"], fg=P["sub"], cursor="hand2", padx=app.S(10))
+        P, S = app.P, app.S
+        super().__init__(parent, app, P["card"], P["border"], 12)
+        self.configure(cursor="hand2")
+        self.app, self.ip, self.hot, self.active = app, ip, False, False
+        f = self.inner
+        f.columnconfigure(1, weight=1)
+        self.icon = Circle(f, app, 46, IC["laptop"], 16)
+        self.icon.grid(row=0, column=0, rowspan=2, padx=(S(12), S(12)), pady=S(12))
+        self.name = tk.Label(f, bg=P["card"], fg=P["text"], font=(FONT, 12, "bold"), anchor="w")
+        self.name.grid(row=0, column=1, sticky="sw", pady=(S(12), 0))
+        self.status = tk.Label(f, bg=P["card"], fg=P["sub"], font=(FONT, 10), anchor="w")
+        self.status.grid(row=1, column=1, sticky="nw", pady=(0, S(12)))
+        self.x = tk.Label(f, text=IC["close"], font=(ICONS, 10), bg=P["card"], fg=P["sub"], cursor="hand2", padx=S(12))
         self.x.bind("<ButtonRelease-1>", lambda e: app.cancel_for(ip))
-        self.bar = tk.Canvas(self, height=app.S(5), bg=P["track"], highlightthickness=0)
-        self.fill = self.bar.create_rectangle(0, 0, 0, app.S(5), fill=P["accent"], outline="")
+        self.bar = tk.Canvas(f, height=S(8), bg=P["card"], highlightthickness=0)
+        self.track = self.bar.create_line(0, 0, 0, 0, width=S(6), capstyle="round", fill=P["track"])
+        self.fill_line = self.bar.create_line(0, 0, 0, 0, width=S(6), capstyle="round", fill=P["accent"])
         self.showing_bar = self.showing_x = False
-        for w in (self, self.icon, self.name, self.status):
+        for w in (self, f, self.icon, self.name, self.status):
             w.bind("<ButtonRelease-1>", lambda e: app.on_card_click(ip))
             w.bind("<Enter>", lambda e: self.hover(True))
             w.bind("<Leave>", self.leave)
@@ -191,14 +286,13 @@ class DeviceCard(tk.Frame):
             self.hover(False)
 
     def hover(self, on):
-        if on != self.hot:
-            self.hot = on
-            self.configure(highlightbackground=self.app.P["accent"] if on else self.app.P["border"])
+        self.hot = on
+        self.set_outline(self.app.P["accent"] if (on or self.active) else self.app.P["border"])
 
     def update_view(self, name, status, fg, circle_bg, glyph, pct=None, cancellable=False):
-        P = self.app.P
-        if self.name["text"] != name:
-            self.name.configure(text=short(name, 34))
+        S = self.app.S
+        if self.name["text"] != short(name, 30):
+            self.name.configure(text=short(name, 30))
         if self.status["text"] != status or self.status["fg"] != fg:
             self.status.configure(text=status, fg=fg)
         self.icon.set(circle_bg, fg, glyph)
@@ -206,16 +300,20 @@ class DeviceCard(tk.Frame):
             self.showing_x = cancellable
             (self.x.grid(row=0, column=2, rowspan=2, sticky="ns") if cancellable else self.x.grid_remove())
         show_bar = pct is not None
+        if show_bar != self.active:
+            self.active = show_bar
+            self.hover(self.hot)
         if show_bar != self.showing_bar:
             self.showing_bar = show_bar
             if show_bar:
-                self.bar.grid(row=2, column=0, columnspan=3, sticky="ew", padx=self.app.S(12), pady=(0, self.app.S(10)))
+                self.bar.grid(row=2, column=0, columnspan=3, sticky="ew", padx=S(14), pady=(0, S(12)))
             else:
                 self.bar.grid_remove()
         if show_bar:
-            w = self.bar.winfo_width()
-            self.bar.coords(self.fill, 0, 0, max(0, w * pct), self.app.S(5))
-            self.bar.itemconfigure(self.fill, fill=fg)
+            w, y, r = self.bar.winfo_width(), S(4), S(3)
+            self.bar.coords(self.track, r, y, max(r, w - r), y)
+            self.bar.coords(self.fill_line, r, y, max(r, r + (w - 2 * r) * pct), y)
+            self.bar.itemconfigure(self.fill_line, fill=fg)
 
 
 class Dialog(tk.Toplevel):
@@ -245,25 +343,29 @@ class Dialog(tk.Toplevel):
         c.pack(side="left", padx=(0, S(12)))
         tf = tk.Frame(top, bg=P["card"])
         tf.pack(side="left", fill="x", expand=True)
-        tk.Label(tf, text=heading, bg=P["card"], fg=P["text"], font=(FONT, 12, "bold"), anchor="w",
+        tk.Label(tf, text=heading, bg=P["card"], fg=P["text"], font=(FONT, 13, "bold"), anchor="w",
                  justify="left", wraplength=S(360)).pack(anchor="w")
         if sub:
-            tk.Label(tf, text=sub, bg=P["card"], fg=P["sub"], font=(FONT, 9), anchor="w", justify="left",
-                     wraplength=S(360)).pack(anchor="w")
+            tk.Label(tf, text=sub, bg=P["card"], fg=P["sub"], font=(FONT, 10), anchor="w", justify="left",
+                     wraplength=S(380)).pack(anchor="w")
         if names:
-            lst = tk.Frame(body, bg=P["bg"], padx=S(12), pady=S(8))
-            lst.pack(fill="x", pady=(S(14), 0))
+            box = RoundCard(body, app, P["bg"], P["border"], 8)
+            box.pack(fill="x", pady=(S(14), 0))
+            lst = tk.Frame(box.inner, bg=P["bg"], padx=S(10), pady=S(6))
+            lst.pack(fill="x")
             for text, tag in names:
                 row = tk.Frame(lst, bg=P["bg"])
                 row.pack(fill="x", pady=1)
-                tk.Label(row, text=short(text, 48), bg=P["bg"], fg=P["text"], font=(FONT, 9), anchor="w").pack(side="left")
+                tk.Label(row, text=short(text, 48), bg=P["bg"], fg=P["text"], font=(FONT, 10), anchor="w").pack(side="left")
                 if tag:
-                    tk.Label(row, text=tag, bg=P["warn_bg"], fg=P["warn"], font=(FONT, 8), padx=6).pack(side="right")
+                    tk.Label(row, text=tag, bg=P["warn_bg"], fg=P["warn"], font=(FONT, 9), padx=6).pack(side="right")
         if note:
-            nf = tk.Frame(body, bg=P["warn_bg"], padx=S(12), pady=S(8))
-            nf.pack(fill="x", pady=(S(10), 0))
+            nbox = RoundCard(body, app, P["warn_bg"], P["warn_bg"], 8)
+            nbox.pack(fill="x", pady=(S(10), 0))
+            nf = tk.Frame(nbox.inner, bg=P["warn_bg"], padx=S(10), pady=S(6))
+            nf.pack(fill="x")
             tk.Label(nf, text=IC["warn"], font=(ICONS, 10), bg=P["warn_bg"], fg=P["warn"]).pack(side="left", padx=(0, 8))
-            tk.Label(nf, text=note, bg=P["warn_bg"], fg=P["warn"], font=(FONT, 9), justify="left",
+            tk.Label(nf, text=note, bg=P["warn_bg"], fg=P["warn"], font=(FONT, 10), justify="left",
                      wraplength=S(330)).pack(side="left")
         self.entry_var = None
         if entry is not None:
@@ -368,8 +470,10 @@ class App:
 
         root.title("FastShare")
         root.configure(bg=self.P["bg"])
-        root.geometry(f"{self.S(900)}x{self.S(600)}")
-        root.minsize(self.S(760), self.S(520))
+        root.geometry(f"{self.S(980)}x{self.S(680)}")
+        root.minsize(self.S(840), self.S(600))
+        self.ssid = None
+        self._ip, self._ip_at = C.local_ip(), time.time()
         root.report_callback_exception = self.on_ui_error
         self.build()
         self.dark_titlebar(root)
@@ -400,11 +504,8 @@ class App:
         P, S = self.P, self.S
         hdr = tk.Frame(self.root, bg=P["bg"], padx=S(20), pady=S(14))
         hdr.pack(fill="x")
-        tk.Label(hdr, text=IC["bolt"], font=(ICONS, 15), bg=P["bg"], fg=P["accent"]).pack(side="left")
-        tk.Label(hdr, text="FastShare", font=(FONT, 15, "bold"), bg=P["bg"], fg=P["text"]).pack(side="left", padx=(S(6), 0))
-        self.net_lbl = tk.Label(hdr, text="", font=(FONT, 9), bg=P["bg"], fg=P["sub"])
-        self.net_lbl.pack(side="right")
-        tk.Label(hdr, text=IC["wifi"], font=(ICONS, 10), bg=P["bg"], fg=P["sub"]).pack(side="right", padx=(0, S(6)))
+        tk.Label(hdr, text=IC["bolt"], font=(ICONS, 16), bg=P["bg"], fg=P["accent_text"]).pack(side="left")
+        tk.Label(hdr, text="FastShare", font=(FONT, 16, "bold"), bg=P["bg"], fg=P["text"]).pack(side="left", padx=(S(8), 0))
 
         body = tk.Frame(self.root, bg=P["bg"], padx=S(20))
         body.pack(fill="both", expand=True)
@@ -415,13 +516,13 @@ class App:
         # ---- left: drop zone + queue
         left = tk.Frame(body, bg=P["bg"])
         left.grid(row=0, column=0, sticky="nsew", padx=(0, S(16)))
-        self.drop = tk.Canvas(left, height=S(230), bg=P["bg"], highlightthickness=0, cursor="hand2")
+        self.drop = tk.Canvas(left, height=S(270), bg=P["bg"], highlightthickness=0, cursor="hand2")
         self.drop.pack(fill="x")
         self.drop_hot = False
         self.drop.bind("<Configure>", lambda e: self.draw_drop())
         self.drop.bind("<ButtonRelease-1>", lambda e: self.pick_files())
-        self.b_files = Btn(self.drop, self, "Select files", self.pick_files)
-        self.b_folder = Btn(self.drop, self, "Select folder", self.pick_folder)
+        self.b_files = Btn(self.drop, self, "Select files", self.pick_files, icon=IC["file"], size=11, bg=P["drop"])
+        self.b_folder = Btn(self.drop, self, "Select folder", self.pick_folder, icon=IC["folder"], size=11, bg=P["drop"])
         if HAVE_DND:
             for w in (self.root, self.drop):
                 try:
@@ -432,14 +533,15 @@ class App:
                 except Exception as ex:
                     log(f"dnd register failed: {ex}")
 
-        qcard = tk.Frame(left, bg=P["card"], highlightthickness=1, highlightbackground=P["border"])
-        qcard.pack(fill="both", expand=True, pady=(S(12), S(12)))
+        qc = RoundCard(left, self, P["card"], P["border"], 12, stretch=True)
+        qc.pack(fill="both", expand=True, pady=(S(14), S(14)))
+        qcard = qc.inner
         qh = tk.Frame(qcard, bg=P["card"], padx=S(14), pady=S(10))
         qh.pack(fill="x")
-        tk.Label(qh, text="Ready to send", font=(FONT, 10, "bold"), bg=P["card"], fg=P["text"]).pack(side="left")
+        tk.Label(qh, text="Ready to send", font=(FONT, 12, "bold"), bg=P["card"], fg=P["text"]).pack(side="left")
         self.clear_btn = Btn(qh, self, "Clear", self.clear_queue, "link")
         self.clear_btn.pack(side="right")
-        self.q_total = tk.Label(qh, text="", font=(FONT, 9), bg=P["card"], fg=P["sub"])
+        self.q_total = tk.Label(qh, text="", font=(FONT, 11), bg=P["card"], fg=P["sub"])
         self.q_total.pack(side="right", padx=S(8))
         self.q_rows = tk.Frame(qcard, bg=P["card"], padx=S(14))
         self.q_rows.pack(fill="both", expand=True, pady=(0, S(8)))
@@ -449,45 +551,60 @@ class App:
         right.grid(row=0, column=1, sticky="nsew")
         rh = tk.Frame(right, bg=P["bg"])
         rh.pack(fill="x", pady=(0, S(8)))
-        tk.Label(rh, text="Nearby devices", font=(FONT, 11, "bold"), bg=P["bg"], fg=P["text"]).pack(side="left")
-        Btn(rh, self, "+ Add by IP", self.add_by_ip, "link").pack(side="right")
+        tk.Label(rh, text="Nearby devices", font=(FONT, 13, "bold"), bg=P["bg"], fg=P["text"]).pack(side="left")
+        self.net_lbl = tk.Label(rh, text="", font=(FONT, 11), bg=P["bg"], fg=P["sub"])
+        self.net_lbl.pack(side="right")
+        tk.Label(rh, text=IC["wifi"], font=(ICONS, 11), bg=P["bg"], fg=P["sub"]).pack(side="right", padx=(0, S(6)))
         self.dev_frame = tk.Frame(right, bg=P["bg"])
         self.dev_frame.pack(fill="x")
-        self.search = tk.Frame(right, bg=P["bg"], highlightthickness=1, highlightbackground=P["border"])
-        self.search.pack(fill="x", pady=(S(8), 0))
-        self.search_icon = Circle(self.search, self, 40, IC["search"], 13)
+        sc = RoundCard(right, self, P["bg"], P["border"], 12, dash=(5, 4))
+        sc.pack(fill="x", pady=(0, 0))
+        self.search = sc.inner
+        self.search_icon = Circle(self.search, self, 46, IC["search"], 15)
         self.search_icon.set(P["track"], P["sub"], bg=P["bg"])
-        self.search_icon.pack(side="left", padx=(S(12), S(10)), pady=S(10))
+        self.search_icon.pack(side="left", padx=(S(12), S(12)), pady=S(12))
         sf = tk.Frame(self.search, bg=P["bg"])
         sf.pack(side="left", fill="x", expand=True)
-        self.search_lbl = tk.Label(sf, text="Looking for devices", font=(FONT, 10), bg=P["bg"], fg=P["sub"], anchor="w")
+        self.search_lbl = tk.Label(sf, text="Looking for devices", font=(FONT, 12), bg=P["bg"], fg=P["sub"], anchor="w")
         self.search_lbl.pack(anchor="w")
         self.search_hint = tk.Label(sf, text="Open FastShare on the other PC. Both need the same Wi-Fi, set to Private.",
-                                    font=(FONT, 8), bg=P["bg"], fg=P["muted"], anchor="w", justify="left", wraplength=S(300))
+                                    font=(FONT, 9), bg=P["bg"], fg=P["muted"], anchor="w", justify="left", wraplength=S(300))
         self.search_hint.pack(anchor="w")
+        Btn(right, self, "+ Add a device by IP address", self.add_by_ip, "link").pack(anchor="w", pady=(S(10), 0))
 
         # ---- footer
-        foot = tk.Frame(self.root, bg=P["card"], highlightthickness=1, highlightbackground=P["border"], padx=S(20), pady=S(9))
+        foot = tk.Frame(self.root, bg=P["bg"], padx=S(20), pady=S(12))
         foot.pack(fill="x", side="bottom")
-        self.me_lbl = tk.Label(foot, text="", font=(FONT, 9), bg=P["card"], fg=P["sub"])
-        self.me_lbl.pack(side="left")
+        tk.Frame(self.root, bg=P["border"], height=1).pack(fill="x", side="bottom")
+
+        def group(side, glyph, **kw):
+            g = tk.Frame(foot, bg=P["bg"])
+            g.pack(side=side, **kw)
+            tk.Label(g, text=glyph, font=(ICONS, 11), bg=P["bg"], fg=P["sub"]).pack(side="left", padx=(0, S(6)))
+            return g
+        g = group("left", IC["eye"])
+        tk.Label(g, text="Visible as", font=(FONT, 11), bg=P["bg"], fg=P["sub"]).pack(side="left")
+        self.me_lbl = tk.Label(g, text="", font=(FONT, 11, "bold"), bg=P["bg"], fg=P["text"])
+        self.me_lbl.pack(side="left", padx=(S(4), 0))
+        g = group("left", IC["shield"], padx=(S(36), 0))
         self.ask_var = tk.BooleanVar(value=self.ask_first)
-        tk.Checkbutton(foot, text="Ask before receiving", variable=self.ask_var, command=self.save_settings,
-                       font=(FONT, 9), bg=P["card"], fg=P["sub"], activebackground=P["card"], activeforeground=P["text"],
-                       selectcolor=P["bg"], highlightthickness=0, bd=0, cursor="hand2").pack(side="left", padx=S(24))
-        Btn(foot, self, "Change", self.change_dir, "link").pack(side="right")
-        self.dir_btn = Btn(foot, self, "", lambda: open_folder(self.save_dir), "link")
-        self.dir_btn.pack(side="right", padx=(0, S(10)))
-        tk.Label(foot, text="Saving to", font=(FONT, 9), bg=P["card"], fg=P["sub"]).pack(side="right", padx=(0, S(4)))
+        self.ask_lbl = tk.Label(g, text="", font=(FONT, 11), bg=P["bg"], fg=P["sub"], cursor="hand2")
+        self.ask_lbl.pack(side="left")
+        self.ask_lbl.bind("<ButtonRelease-1>", lambda e: (self.ask_var.set(not self.ask_var.get()), self.save_settings()))
+        g = group("right", IC["download"])
+        self.dir_btn = Btn(g, self, "", lambda: open_folder(self.save_dir), "link")
+        self.dir_btn.pack(side="left")
+        Btn(g, self, "Change", self.change_dir, "link").pack(side="left", padx=(S(10), 0))
         self.update_dir_label()
+        self.update_ask_label()
 
         # ---- toast
         self.toast_frame = tk.Frame(self.root, bg=P["toast"], padx=S(14), pady=S(8))
-        self.toast_lbl = tk.Label(self.toast_frame, text="", bg=P["toast"], fg=P["toast_text"], font=(FONT, 9),
+        self.toast_lbl = tk.Label(self.toast_frame, text="", bg=P["toast"], fg=P["toast_text"], font=(FONT, 10),
                                   wraplength=S(560), justify="left")
         self.toast_lbl.pack(side="left")
         self.toast_act = tk.Label(self.toast_frame, text="", bg=P["toast"], fg=P["toast_text"],
-                                  font=(FONT, 9, "underline"), cursor="hand2")
+                                  font=(FONT, 10, "underline"), cursor="hand2")
         self.toast_act.pack(side="left", padx=(S(12), 0))
 
     def draw_drop(self):
@@ -500,15 +617,19 @@ class App:
         pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1, x0, y1,
                x0, y1 - r, x0, y0 + r, x0, y0]
         c.create_polygon(pts, smooth=True, fill=P["drop_hot"] if self.drop_hot else P["drop"],
-                         outline=P["accent"], dash=(6, 4), width=max(1, S(1.5)))
-        cx, cy = w / 2, h / 2 - S(40)
-        c.create_oval(cx - S(28), cy - S(28), cx + S(28), cy + S(28), fill=P["accent_bg"], outline="")
-        c.create_text(cx, cy, text=IC["download"] if self.drop_hot else IC["upload"], font=(ICONS, 18), fill=P["accent_text"])
+                         outline=P["accent"] if self.drop_hot else P["drop_line"],
+                         dash=(6, 4), width=max(1, S(1.5)))
+        cx, cy = w / 2, h / 2 - S(50)
+        c.create_oval(cx - S(36), cy - S(36), cx + S(36), cy + S(36), fill=P["accent_bg"], outline="")
+        c.create_text(cx, cy, text=IC["download"] if self.drop_hot else IC["upload"], font=(ICONS, 22), fill=P["accent_text"])
         title = "Drop to add" if self.drop_hot else ("Drop files or folders here" if HAVE_DND else "Choose files or folders")
-        c.create_text(cx, cy + S(46), text=title, font=(FONT, 12, "bold"), fill=P["text"])
-        c.create_text(cx, cy + S(68), text="Any size, straight over your Wi-Fi", font=(FONT, 9), fill=P["sub"])
-        c.create_window(cx - S(6), cy + S(104), window=self.b_files, anchor="e")
-        c.create_window(cx + S(6), cy + S(104), window=self.b_folder, anchor="w")
+        c.create_text(cx, cy + S(60), text=title, font=(FONT, 15, "bold"), fill=P["text"])
+        c.create_text(cx, cy + S(88), text="Any size, straight over your Wi-Fi", font=(FONT, 11), fill=P["sub"])
+        bg = P["drop_hot"] if self.drop_hot else P["drop"]
+        self.b_files.set_bg(bg)
+        self.b_folder.set_bg(bg)
+        c.create_window(cx - S(6), cy + S(132), window=self.b_files, anchor="e")
+        c.create_window(cx + S(6), cy + S(132), window=self.b_folder, anchor="w")
 
     def set_drop_hot(self, on):
         if on != self.drop_hot:
@@ -667,22 +788,22 @@ class App:
             self.q_total.configure(text=f"{files} file{'s' if files != 1 else ''} · {C.human(total)}" if n else "")
         if not n:
             tk.Label(self.q_rows, text="Add files, then click a device to send them.\nYou can also drop files straight onto a device.",
-                     bg=P["card"], fg=P["muted"], font=(FONT, 9), justify="left").pack(anchor="w", pady=S(6))
+                     bg=P["card"], fg=P["muted"], font=(FONT, 10), justify="left").pack(anchor="w", pady=S(6))
             return
         MAXROWS = 6
         for e in self.entries[:MAXROWS]:
             row = tk.Frame(self.q_rows, bg=P["card"])
-            row.pack(fill="x", pady=S(2))
-            tk.Label(row, text=IC["folder"] if e["kind"] == "folder" else IC["file"], font=(ICONS, 10),
+            row.pack(fill="x", pady=S(3))
+            tk.Label(row, text=IC["folder"] if e["kind"] == "folder" else IC["file"], font=(ICONS, 11),
                      bg=P["card"], fg=P["accent_text"]).pack(side="left", padx=(0, S(8)))
             label = e["name"] + (f"  ({e['count']} file{'s' if e['count'] != 1 else ''})" if e["kind"] == "folder" else "")
-            tk.Label(row, text=short(label, 40), bg=P["card"], fg=P["text"], font=(FONT, 9), anchor="w").pack(side="left")
+            tk.Label(row, text=short(label, 36), bg=P["card"], fg=P["text"], font=(FONT, 11), anchor="w").pack(side="left")
             x = tk.Label(row, text=IC["close"], font=(ICONS, 8), bg=P["card"], fg=P["muted"], cursor="hand2", padx=S(4))
             x.pack(side="right")
             x.bind("<ButtonRelease-1>", lambda ev, p=e["path"]: self.remove_entry(p))
-            tk.Label(row, text=C.human(e["size"]), bg=P["card"], fg=P["sub"], font=(FONT, 9)).pack(side="right", padx=S(6))
+            tk.Label(row, text=C.human(e["size"]), bg=P["card"], fg=P["sub"], font=(FONT, 11)).pack(side="right", padx=S(6))
         if n > MAXROWS:
-            tk.Label(self.q_rows, text=f"+ {n - MAXROWS} more", bg=P["card"], fg=P["sub"], font=(FONT, 9)).pack(anchor="w", pady=S(2))
+            tk.Label(self.q_rows, text=f"+ {n - MAXROWS} more", bg=P["card"], fg=P["sub"], font=(FONT, 10)).pack(anchor="w", pady=S(2))
 
     # ---------------------------------------------------------------- sending
     def peer_name(self, ip):
@@ -929,15 +1050,25 @@ class App:
             self.render_queue()
         if self.toast_until and now > self.toast_until:
             self.hide_toast()
-        if now - getattr(self, "_ip_at", 0) > 5:
-            self._ip_at, self._ip = now, C.local_ip()
+        if now - self._ip_at > 15:
+            self._ip_at = now
+
+            def refresh():
+                ip, name = C.local_ip(), wifi_name()
+                self.q.put(lambda: (setattr(self, "_ip", ip), setattr(self, "ssid", name)))
+            threading.Thread(target=refresh, daemon=True).start()
         ip = self._ip
-        self.me_lbl.configure(text=f"Visible as {C.HOSTNAME}")
-        self.net_lbl.configure(text=ip if not ip.startswith("127.") else "Not connected to a network")
+        offline = ip.startswith("127.")
+        self.me_lbl.configure(text=f"{C.HOSTNAME}  ({ip})" if not offline else C.HOSTNAME)
+        self.net_lbl.configure(text="Not connected" if offline else (self.ssid or "Local network"))
 
     # ---------------------------------------------------------------- settings / misc
+    def update_ask_label(self):
+        self.ask_lbl.configure(text=f"Ask before receiving: {'on' if self.ask_var.get() else 'off'}")
+
     def save_settings(self):
         self.ask_first = bool(self.ask_var.get())
+        self.update_ask_label()
         self.cfg.update(save_dir=self.save_dir, ask_first=self.ask_first, manual=self.manual)
         save_config(self.cfg)
 
@@ -945,7 +1076,7 @@ class App:
         d = self.save_dir
         home = os.path.expanduser("~")
         shown = d.replace(home, "~", 1) if d.startswith(home) else d
-        self.dir_btn.configure(text=short(shown, 38))
+        self.dir_btn.configure(text=short(shown, 34))
 
     def change_dir(self):
         d = filedialog.askdirectory(parent=self.root, initialdir=self.save_dir, title="Where should received files go?")
