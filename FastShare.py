@@ -470,8 +470,10 @@ class App:
 
         root.title("FastShare")
         root.configure(bg=self.P["bg"])
-        root.geometry(f"{self.S(980)}x{self.S(680)}")
-        root.minsize(self.S(840), self.S(600))
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(self.S(980), sw - self.S(40)), min(self.S(680), sh - self.S(90))
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - self.S(20))}")
+        root.minsize(min(self.S(840), w), min(self.S(600), h))
         self.ssid = None
         self._ip, self._ip_at = C.local_ip(), time.time()
         root.report_callback_exception = self.on_ui_error
